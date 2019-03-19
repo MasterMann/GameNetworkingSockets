@@ -16,6 +16,7 @@
 	#include <winsock2.h>
 	#include <ws2tcpip.h>
 	#define MSG_NOSIGNAL 0
+	#undef SetPort
 #else
 	#include <sys/types.h>
 	#include <sys/socket.h>
@@ -42,9 +43,14 @@
 #include <tier0/basetypes.h>
 #include <tier0/t0constants.h>
 #include <tier0/platform.h>
-#include <steamnetworkingsockets/steamnetworkingtypes.h>
+#include <tier0/dbgflag.h>
+#ifdef STEAMNETWORKINGSOCKETS_STEAM
+	#include <tier0/validator.h>
+#endif
+#include <steam/steamnetworkingtypes.h>
 #include <tier1/netadr.h>
 #include <vstdlib/strtools.h>
+#include <vstdlib/random.h>
 #include <tier1/utlvector.h>
 #include <tier1/utlbuffer.h>
 #include "keypair.h"
@@ -101,6 +107,16 @@ struct SteamNetworkingDetailedConnectionStatus;
 // Internal stuff goes in a private namespace
 namespace SteamNetworkingSocketsLib {
 
+// An identity operator that always returns its operand.
+// NOTE: std::hash is an identity operator on many compilers
+//       for the basic primitives.  If you really need actual
+//       hashing, don't use std::hash!
+template <typename T >
+struct Identity
+{
+	 const T &operator()( const T &x ) const { return x; }
+};
+
 inline int GetLastSocketError()
 {
 	#ifdef WIN32
@@ -140,25 +156,29 @@ const int k_cbSteamNetworkingSocketsMaxReliableMessageSegment = k_cbSteamNetwork
 /// frame in the packet and thus no explicit size field will be needed.
 const int k_cbSteamNetworkingSocketsMaxReliableMessageSegmentFrame = k_cbSteamNetworkingSocketsMaxReliableMessageSegment + 7;
 
-/// Currently 16-byte AES
+/// Currently we always use AES Rijndael for symmetric encryption,
+/// which has a block size of 128 bits.  This is not configurable.
 const int k_cbSteamNetworkingSocketsEncryptionBlockSize = 16;
 
-/// Max length of encrypted payload we will send.
-const int k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend = 1248;
-COMPILE_TIME_ASSERT( k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend % k_cbSteamNetworkingSocketsEncryptionBlockSize == 0 );
+/// Size of security tag for AES-GCM.
+/// It would be nice to use a smaller tag, but BCrypt requires a 16-byte tag,
+/// which is what OpenSSL uses by default for TLS.
+const int k_cbSteamNetwokingSocketsEncrytionTagSize = 16;
 
-/// Max length of plaintext payload we could send.  We need at least
-/// one byte of pad, so an exact multiple of the key size would
-/// basically be guaranteeing a full key's worth of pad and would
-/// be bad.  Leaving exactly one byte would be OK.  Maybe that's
-/// ideal?  For some reason I'd like to use a more round number.  That might be misguided, but it feels right.
-const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend = k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend-4;
+/// Max length of plaintext and encrypted payload we will send.  AES-GCM does
+/// not use padding (but it does have the security tag).  So this can be
+/// arbitrary, it does not need to account for the block size.
+const int k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend = 1248;
+const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend = k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend-k_cbSteamNetwokingSocketsEncrytionTagSize;
 
 /// Use larger limits for what we are willing to receive.
 const int k_cbSteamNetworkingSocketsMaxEncryptedPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 
 /// Make sure we have enough room for our headers and occasional inline pings and stats and such
+/// FIXME - For relayed connections, we send some of the stats outside the encrypted block, so that
+/// they can be observed by the relay.  For direct connections, we put it in the encrypted block.
+/// So we might need to adjust this to be per connection type instead off constant.
 COMPILE_TIME_ASSERT( k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend + 50 < k_cbSteamNetworkingSocketsMaxUDPMsgLen );
 
 /// Min size of raw UDP message.
@@ -167,9 +187,10 @@ const int k_nMinSteamDatagramUDPMsgLen = 5;
 /// When sending a stats message, what sort of reply is requested by the calling code?
 enum EStatsReplyRequest
 {
-	k_EStatsReplyRequest_None,
-	k_EStatsReplyRequest_DelayedOK,
-	k_EStatsReplyRequest_Immediate,
+	k_EStatsReplyRequest_NothingToSend, // We don't have anything to send at all
+	k_EStatsReplyRequest_NoReply, // We have something to send, but it does not require a reply
+	k_EStatsReplyRequest_DelayedOK, // We have something to send, but a delayed reply is OK
+	k_EStatsReplyRequest_Immediate, // Immediate reply is requested
 };
 
 /// Max time that we we should "Nagle" an ack, hoping to combine them together or
@@ -234,12 +255,17 @@ COMPILE_TIME_ASSERT( ( k_usecTimeSinceLastPacketMaxReasonable >> k_usecTimeSince
 const uint32 k_usecTimeSinceLastPacketMinReasonable = k_nMillion/250;
 COMPILE_TIME_ASSERT( ( k_usecTimeSinceLastPacketMinReasonable >> k_usecTimeSinceLastPacketSerializedPrecisionShift ) > 64 ); // make sure the minimum reasonable value can be serialized with sufficient precision.
 
-/// What universe are we running in?  Set at init time
-extern EUniverse g_eUniverse;
+/// Protocol version of this code.  This is a blunt instrument, which is incremented when we
+/// wish to change the wire protocol in a way that doesn't have some other easy
+/// mechanism for dealing with compatibility (e.g. using protobuf's robust mechanisms).
+const uint32 k_nCurrentProtocolVersion = 8;
 
-/// Protocol version of this code
-const uint32 k_nCurrentProtocolVersion = 5;
-const uint32 k_nMinRequiredProtocolVersion = 5;
+/// Minimum required version we will accept from a peer.  We increment this
+/// when we introduce wire breaking protocol changes and do not wish to be
+/// backward compatible.  This has been fine before the	first major release,
+/// but once we make a big public release, we probably won't ever be able to
+/// do this again, and we'll need to have more sophisticated mechanisms. 
+const uint32 k_nMinRequiredProtocolVersion = 8;
 
 // Serialize an UNSIGNED quantity.  Returns pointer to the next byte.
 // https://developers.google.com/protocol-buffers/docs/encoding
@@ -392,9 +418,6 @@ inline std::string Indent( const std::string &s ) { return Indent( s.c_str() ); 
 /// Generate a fingerprint for a public that is reasonably collision resistant,
 /// although not really cryptographically secure.  (We are in charge of the
 /// set of public keys and we expect it to be reasonably small.)
-#ifdef SDR_SUPPORT_RSA_TICKETS
-extern uint64 CalculatePublicKeyID( const CRSAPublicKey &pubKey );
-#endif
 extern uint64 CalculatePublicKeyID( const CECSigningPublicKey &pubKey );
 
 inline bool IsPrivateIP( uint32 unIP )
@@ -409,6 +432,22 @@ inline bool IsPrivateIP( uint32 unIP )
 	return false;
 }
 
+inline void SteamNetworkingIPAddrToNetAdr( netadr_t &netadr, const SteamNetworkingIPAddr &addr )
+{
+	uint32 ipv4 = addr.GetIPv4();
+	if ( ipv4 )
+		netadr.SetIP( ipv4 );
+	else
+		netadr.SetIPV6( addr.m_ipv6 );
+	netadr.SetPort( addr.m_port );
+}
+
+inline void NetAdrToSteamNetworkingIPAddr( SteamNetworkingIPAddr &addr, const netadr_t &netadr )
+{
+	netadr.GetIPV6( addr.m_ipv6 );
+	addr.m_port = netadr.GetPort();
+}
+
 template <typename T>
 inline int64 NearestWithSameLowerBits( T nLowerBits, int64 nReference )
 {
@@ -416,6 +455,229 @@ inline int64 NearestWithSameLowerBits( T nLowerBits, int64 nReference )
 	COMPILE_TIME_ASSERT( ~T(0) < 0 ); // make sure it's a signed type!
 	T nDiff = nLowerBits - T( nReference );
 	return nReference + nDiff;
+}
+
+/// Calculate hash of identity.
+struct SteamNetworkingIdentityHash
+{
+	uint32 operator()( const SteamNetworkingIdentity &x ) const;
+};
+
+struct SteamNetworkingIdentityRender
+{
+	SteamNetworkingIdentityRender( const SteamNetworkingIdentity &x ) { x.ToString( buf, sizeof(buf) ); }
+	inline const char *c_str() const { return buf; }
+private:
+	char buf[ SteamNetworkingIdentity::k_cchMaxString ];
+};
+
+inline bool IsValidSteamIDForIdentity( CSteamID steamID )
+{
+	return steamID.GetAccountID() != 0 && ( steamID.BIndividualAccount() || steamID.BGameServerAccount() );
+}
+
+inline bool IsValidSteamIDForIdentity( uint64 steamid64 ) { return IsValidSteamIDForIdentity( CSteamID( steamid64 ) ); }
+
+extern bool BSteamNetworkingIdentityToProtobufInternal( const SteamNetworkingIdentity &identity, CMsgSteamNetworkingIdentity *msgIdentity, SteamDatagramErrMsg &errMsg );
+extern bool BSteamNetworkingIdentityToProtobufInternal( const SteamNetworkingIdentity &identity, std::string *bytesMsgIdentity, SteamDatagramErrMsg &errMsg );
+#define BSteamNetworkingIdentityToProtobuf( identity, msg, field_identity, field_legacy_steam_id, errMsg ) ( \
+		( (identity).GetSteamID64() ? (void)(msg).set_ ## field_legacy_steam_id( (identity).GetSteamID64() ) : (void)0 ), \
+		BSteamNetworkingIdentityToProtobufInternal( identity, (msg).mutable_ ## field_identity(), errMsg ) \
+	)
+#define SteamNetworkingIdentityToProtobuf( identity, msg, field_identity, field_legacy_steam_id ) \
+	{ SteamDatagramErrMsg identityToProtobufErrMsg; \
+		if ( !BSteamNetworkingIdentityToProtobuf( identity, msg, field_identity, field_legacy_steam_id, identityToProtobufErrMsg ) ) { \
+			AssertMsg2( false, "Failed to serialize identity to %s message.  %s", msg.GetTypeName().c_str(), identityToProtobufErrMsg ); \
+		} \
+	}
+
+extern bool BSteamNetworkingIdentityFromProtobufBytes( SteamNetworkingIdentity &identity, const std::string &bytesMsgIdentity, uint64 legacy_steam_id, SteamDatagramErrMsg &errMsg );
+extern bool BSteamNetworkingIdentityFromProtobufMsg( SteamNetworkingIdentity &identity, const CMsgSteamNetworkingIdentity &msgIdentity, SteamDatagramErrMsg &errMsg );
+extern bool BSteamNetworkingIdentityFromLegacySteamID( SteamNetworkingIdentity &identity, uint64 legacy_steam_id, SteamDatagramErrMsg &errMsg );
+
+template <typename TStatsMsg>
+inline uint32 StatsMsgImpliedFlags( const TStatsMsg &msg );
+
+template <typename TStatsMsg>
+inline void SetStatsMsgFlagsIfNotImplied( TStatsMsg &msg, uint32 nFlags )
+{
+	if ( ( nFlags & StatsMsgImpliedFlags( msg ) ) != nFlags )
+		msg.set_flags( nFlags );
+	else
+		msg.clear_flags(); // All flags we needed to send are implied by message, no need to send explicitly
+}
+
+// Returns:
+// <0 Bad data
+// 0  No data
+// >0 OK
+#define SteamNetworkingIdentityFromProtobuf( identity, msg, field_identity, field_legacy_steam_id, errMsg ) \
+	( \
+		(msg).has_ ##field_identity() ? ( BSteamNetworkingIdentityFromProtobufMsg( identity, (msg).field_identity(), errMsg ) ? +1 : -1 ) \
+		: (msg).has_ ##field_legacy_steam_id() ? ( BSteamNetworkingIdentityFromLegacySteamID( identity, (msg).field_legacy_steam_id(), errMsg ) ? +1 : -1 ) \
+		: ( V_strcpy_safe( errMsg, "No identity data" ), 0 ) \
+	)
+inline int SteamNetworkingIdentityFromCert( SteamNetworkingIdentity &result, const CMsgSteamDatagramCertificate &msgCert, SteamDatagramErrMsg &errMsg )
+{
+	return SteamNetworkingIdentityFromProtobuf( result, msgCert, identity, legacy_steam_id, errMsg );
+}
+
+// NOTE: Does NOT check the cert signature!
+extern int SteamNetworkingIdentityFromSignedCert( SteamNetworkingIdentity &result, const CMsgSteamDatagramCertificateSigned &msgCertSigned, SteamDatagramErrMsg &errMsg );
+
+struct ConfigValueBase
+{
+
+	// Config value we should inherit from, if we are not set
+	ConfigValueBase *m_pInherit = nullptr;
+
+	// Is the value set?
+	bool m_bValueSet = false;
+};
+
+template<typename T>
+struct ConfigValue : public ConfigValueBase
+{
+	inline ConfigValue() : m_data{} {}
+	inline explicit ConfigValue( const T &defaultValue ) : m_data(defaultValue) { m_bValueSet = true; }
+
+	T m_data;
+
+	/// Fetch the effective value
+	inline const T &Get() const
+	{
+		const ConfigValueBase *p = this;
+		while ( !p->m_bValueSet )
+		{
+			Assert( p->m_pInherit );
+			p = p->m_pInherit;
+		}
+
+		const auto *t = static_cast<const ConfigValue<T> *>( p );
+		return t->m_data;
+	}
+
+	void Set( const T &value )
+	{
+		m_data = value;
+		m_bValueSet = true;
+	}
+};
+
+template <typename T> struct ConfigDataTypeTraits {};
+template <> struct ConfigDataTypeTraits<int32> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Int32; };
+template <> struct ConfigDataTypeTraits<int64> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Int64; };
+template <> struct ConfigDataTypeTraits<float> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Float; };
+template <> struct ConfigDataTypeTraits<std::string> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_String; };
+template <> struct ConfigDataTypeTraits<void*> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_FunctionPtr; };
+
+struct GlobalConfigValueEntry
+{
+	GlobalConfigValueEntry( ESteamNetworkingConfigValue eValue, const char *pszName, ESteamNetworkingConfigDataType eDataType, ESteamNetworkingConfigScope eScope, int cbOffsetOf );
+
+	ESteamNetworkingConfigValue const m_eValue;
+	const char *const m_pszName;
+	ESteamNetworkingConfigDataType const m_eDataType;
+	ESteamNetworkingConfigScope const m_eScope;
+	int const m_cbOffsetOf;
+	GlobalConfigValueEntry *m_pNextEntry;
+};
+
+template<typename T>
+struct GlobalConfigValueBase : GlobalConfigValueEntry
+{
+	GlobalConfigValueBase( ESteamNetworkingConfigValue eValue, const char *pszName, const T &defaultValue, ESteamNetworkingConfigScope eScope, int cbOffsetOf )
+	: GlobalConfigValueEntry( eValue, pszName, ConfigDataTypeTraits<T>::k_eDataType, eScope, cbOffsetOf )
+	, m_value{defaultValue} {}
+
+	inline const T &Get() const
+	{
+		Assert( !m_value.m_pInherit );
+		Assert( m_value.m_bValueSet );
+		return m_value.m_data;
+	}
+
+	struct Value : public ConfigValue<T>
+	{
+		inline Value( const T &defaultValue ) : ConfigValue<T>(defaultValue), m_defaultValue(defaultValue) {}
+		const T m_defaultValue;
+	};
+	Value m_value;
+};
+
+template<typename T>
+struct GlobalConfigValue : GlobalConfigValueBase<T>
+{
+	GlobalConfigValue( ESteamNetworkingConfigValue eValue, const char *pszName, const T &defaultValue )
+	: GlobalConfigValueBase<T>( eValue, pszName, defaultValue, k_ESteamNetworkingConfig_Global, 0 ) {}
+};
+
+struct ConnectionConfig
+{
+	ConfigValue<int32> m_TimeoutInitial;
+	ConfigValue<int32> m_TimeoutConnected;
+	ConfigValue<int32> m_SendBufferSize;
+	ConfigValue<int32> m_SendRateMin;
+	ConfigValue<int32> m_SendRateMax;
+	ConfigValue<int32> m_NagleTime;
+	ConfigValue<int32> m_IP_AllowWithoutAuth;
+
+	ConfigValue<int32> m_LogLevel_AckRTT;
+	ConfigValue<int32> m_LogLevel_PacketDecode;
+	ConfigValue<int32> m_LogLevel_Message;
+	ConfigValue<int32> m_LogLevel_PacketGaps;
+
+	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SDR
+		ConfigValue<int32> m_LogLevel_P2PRendezvous;
+		ConfigValue<std::string> m_SDRClient_DebugTicketAddress;
+	#endif
+
+	void Init( ConnectionConfig *pInherit );
+};
+
+template<typename T>
+struct ConnectionConfigDefaultValue : GlobalConfigValueBase<T>
+{
+	ConnectionConfigDefaultValue( ESteamNetworkingConfigValue eValue, const char *pszName, const T &defaultValue, int cbOffsetOf )
+	: GlobalConfigValueBase<T>( eValue, pszName, defaultValue, k_ESteamNetworkingConfig_Connection, cbOffsetOf ) {}
+};
+
+extern GlobalConfigValue<float> g_Config_FakePacketLoss_Send;
+extern GlobalConfigValue<float> g_Config_FakePacketLoss_Recv;
+extern GlobalConfigValue<int32> g_Config_FakePacketLag_Send;
+extern GlobalConfigValue<int32> g_Config_FakePacketLag_Recv;
+extern GlobalConfigValue<float> g_Config_FakePacketReorder_Send;
+extern GlobalConfigValue<float> g_Config_FakePacketReorder_Recv;
+extern GlobalConfigValue<int32> g_Config_FakePacketReorder_Time;
+extern GlobalConfigValue<float> g_Config_FakePacketDup_Send;
+extern GlobalConfigValue<float> g_Config_FakePacketDup_Recv;
+extern GlobalConfigValue<int32> g_Config_FakePacketDup_TimeMax;
+
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SDR
+extern GlobalConfigValue<int32> g_Config_SDRClient_ConsecutitivePingTimeoutsFailInitial;
+extern GlobalConfigValue<int32> g_Config_SDRClient_ConsecutitivePingTimeoutsFail;
+extern GlobalConfigValue<int32> g_Config_SDRClient_MinPingsBeforePingAccurate;
+extern GlobalConfigValue<int32> g_Config_SDRClient_SingleSocket;
+extern GlobalConfigValue<int32> g_Config_LogLevel_SDRRelayPings;
+extern GlobalConfigValue<std::string> g_Config_SDRClient_ForceRelayCluster;
+extern GlobalConfigValue<std::string> g_Config_SDRClient_ForceProxyAddr;
+#endif
+
+// This awkwardness (adding and subtracting sizeof(intptr_t)) silences an UBSan
+// runtime error about "member access within null pointer"
+#define V_offsetof(class, field) (int)((intptr_t)&((class *)(0+sizeof(intptr_t)))->field - sizeof(intptr_t))
+
+#define DEFINE_GLOBAL_CONFIGVAL( type, name, defaultVal ) \
+	GlobalConfigValue<type> g_Config_##name( k_ESteamNetworkingConfig_##name, #name, defaultVal )
+#define DEFINE_CONNECTON_DEFAULT_CONFIGVAL( type, name, defaultVal ) \
+	ConnectionConfigDefaultValue<type> g_ConfigDefault_##name( k_ESteamNetworkingConfig_##name, #name, defaultVal, V_offsetof(ConnectionConfig, m_##name) )
+
+inline bool RandomBoolWithOdds( float odds )
+{
+	Assert( odds >= 0.0f && odds <= 100.0f );
+	if ( odds <= 0.0f )
+		return false;
+	return WeakRandomFloat( 0, 100.0 ) < odds;
 }
 
 } // namespace SteamNetworkingSocketsLib
@@ -528,6 +790,28 @@ template< typename V>
 inline bool has_element( const V &vec, const typename vstd::LikeStdVectorTraits<V>::ElemType &x )
 {
 	return std::find( vec.begin(), vec.end(), x ) != vec.end();
+}
+
+template< typename V>
+inline bool find_and_remove_element( V &vec, const typename vstd::LikeStdVectorTraits<V>::ElemType &x )
+{
+	auto iter = std::find( vec.begin(), vec.end(), x );
+	if ( iter == vec.end() )
+		return false;
+	vec.erase( iter );
+	return true;
+}
+
+template< typename V>
+inline int index_of( const V &vec, const typename vstd::LikeStdVectorTraits<V>::ElemType &x )
+{
+	int l = len( vec );
+	for ( int i = 0 ; i < l ; ++i )
+	{
+		if ( vec[i] == x )
+			return i;
+	}
+	return -1;
 }
 
 namespace vstd
@@ -680,9 +964,8 @@ namespace vstd
 	template< typename T, int N >
 	void small_vector<T,N>::erase( T *it )
 	{
-		T *b = begin();
 		T *e = end();
-		assert( b <= it );
+		assert( begin() <= it );
 		assert( it < e );
 
 		if ( std::is_trivial<T>::value )

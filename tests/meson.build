@@ -1,43 +1,22 @@
-cxx_compiler = meson.get_compiler('cpp')
+common_deps = [ dep_threads ]
+cppflags = []
 
-dependencies = [
-  dependency('threads'),
-  dep_GameNetworkingSockets_so # Declared in the other project
-]
-
-warn_flags_tests = [
-  '-Wall',
-  '-Wextra',
-  '-pedantic',
-  '-Weverything',
-
-  # Explicitly disable a bunch of noisy warnings.
-  '-Wno-documentation',
-  '-Wno-c++98-compat',
-  '-Wno-c++98-compat-pedantic',
-  '-Wno-old-style-cast',
-  '-Wno-exit-time-destructors',
-  '-Wno-global-constructors',
-  '-Wno-padded',
-  '-Wno-signed-enum-bitfield',
-  '-Wno-sign-conversion',
-
-  # The interface classes trigger this, but we don't want to export C++
-  # symbols from the GameNetworkingSockets library.
-  '-Wno-weak-vtables',
-]
-
-cxx_flags = []
-foreach arg : warn_flags_tests
-  if cxx_compiler.has_argument(arg)
-    cxx_flags += [ arg ]
-  endif
-endforeach
+light_tests= get_option('light_tests')
+if light_tests
+  cppflags += ['-DLIGHT_TESTS']
+endif
 
 executable('test_connection',
   'test_connection.cpp',
-  dependencies: dependencies,
-  cpp_args: cxx_flags
+  dependencies: common_deps + [ dep_GameNetworkingSockets_so ],
+  cpp_args: cppflags,
+)
+
+executable('test_crypto',
+  'test_crypto.cpp',
+  dependencies: common_deps + [ dep_GameNetworkingSockets_static ],
+  cpp_args: cppflags + ['-DTEST_VECTOR_DIR="' + join_paths(meson.source_root(), 'tests/aesgcmtestvectors') + '/"'],
+  include_directories: include_directories('../src', '../src/public', '../src/common')
 )
 
 #incdirs = include_directories('../include')

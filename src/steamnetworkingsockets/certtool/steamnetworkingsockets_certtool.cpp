@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "../steamnetworkingsockets_internal.h"
 #include "crypto.h"
@@ -165,17 +166,18 @@ void PrintCertInfo( const CMsgSteamDatagramCertificateSigned &msgSigned, std::st
 	msgCert.ParseFromString( msgSigned.cert() );
 
 	CECSigningPublicKey pubKey;
-	pubKey.Set( msgCert.key_data().c_str(), (uint32)msgCert.key_data().length() );
+	if ( !pubKey.SetRawDataWithoutWipingInput( msgCert.key_data().c_str(), msgCert.key_data().length() ) )
+		Plat_FatalError( "Cert has bad public key" );
 
 	time_t timeCreated = msgCert.time_created();
 	time_t timeExpiry = msgCert.time_expiry();
 
 	char szTimeCreated[ 128 ];
-	Plat_ctime( &timeCreated, szTimeCreated, sizeof(szTimeCreated) );
+	V_strcpy_safe( szTimeCreated, ctime( &timeCreated ) );
 	V_StripTrailingWhitespaceASCII( szTimeCreated );
 
 	char szTimeExpiry[ 128 ];
-	Plat_ctime( &timeExpiry, szTimeExpiry, sizeof(szTimeExpiry) );
+	V_strcpy_safe( szTimeExpiry, ctime( &timeExpiry ) );
 	V_StripTrailingWhitespaceASCII( szTimeExpiry );
 
 	std::string sDataCenterIDs;
@@ -249,7 +251,7 @@ void CreateCert()
 
 	CMsgSteamDatagramCertificate msgCert;
 	msgCert.set_key_type( CMsgSteamDatagramCertificate_EKeyType_ED25519 );
-	msgCert.set_key_data( s_keyCertPub.GetData(), s_keyCertPub.GetLength() );
+	DbgVerify( s_keyCertPub.GetRawDataAsStdString( msgCert.mutable_key_data() ) );
 	msgCert.set_time_created( time( nullptr ) );
 	msgCert.set_time_expiry( msgCert.time_created() + s_nExpiryDays*24*3600 );
 	for ( uint32 id: s_vecDataCenterIDs )
@@ -260,7 +262,7 @@ void CreateCert()
 	msgSigned.set_cert( msgCert.SerializeAsString() );
 
 	CryptoSignature_t sig;
-	CCrypto::GenerateSignature( (const uint8 *)msgSigned.cert().c_str(), (uint32)msgSigned.cert().length(), s_keyCAPriv, &sig );
+	s_keyCAPriv.GenerateSignature( msgSigned.cert().c_str(), msgSigned.cert().length(), &sig );
 	msgSigned.set_ca_key_id( nCAKeyID );
 	msgSigned.set_ca_signature( &sig, sizeof(sig) );
 
@@ -368,7 +370,7 @@ int main( int argc, char **argv )
 		if ( !V_stricmp( pszSwitch, "--pub-key" ) )
 		{
 			GET_ARG();
-			if ( !s_keyCertPub.Set( pszArg, V_strlen(pszArg) ) )
+			if ( !s_keyCertPub.SetFromOpenSSHAuthorizedKeys( pszArg, V_strlen(pszArg) ) )
 				Plat_FatalError( "'%s' isn't a valid authorized_keys style public Ed25519 keyfile.  (Try exporting from OpenSSH)\n", pszArg );
 			continue;
 		}

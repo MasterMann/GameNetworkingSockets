@@ -96,7 +96,8 @@ static void InitSteamDatagramConnectionSockets()
 		if ( !GameNetworkingSockets_Init( nullptr, errMsg ) )
 			FatalError( "GameNetworkingSockets_Init failed.  %s", errMsg );
 	#else
-		SteamDatagramClient_SetAppIDAndUniverse( 570, k_EUniverseDev ); // Just set something, doesn't matter what
+		SteamDatagramClient_SetAppID( 570 ); // Just set something, doesn't matter what
+		//SteamDatagramClient_SetUniverse( k_EUniverseDev );
 
 		SteamDatagramErrMsg errMsg;
 		if ( !SteamDatagramClient_Init( true, errMsg ) )
@@ -239,7 +240,7 @@ public:
 		SteamNetworkingIPAddr serverLocalAddr;
 		serverLocalAddr.Clear();
 		serverLocalAddr.m_port = nPort;
-		m_hListenSock = m_pInterface->CreateListenSocketIP( serverLocalAddr );
+		m_hListenSock = m_pInterface->CreateListenSocketIP( serverLocalAddr, 0, nullptr );
 		if ( m_hListenSock == k_HSteamListenSocket_Invalid )
 			FatalError( "Failed to listen on port %d", nPort );
 		Printf( "Server listening on port %d\n", nPort );
@@ -282,7 +283,7 @@ private:
 
 	void SendStringToClient( HSteamNetConnection conn, const char *str )
 	{
-		m_pInterface->SendMessageToConnection( conn, str, (uint32)strlen(str), k_nSteamNetworkingSend_Reliable );
+		m_pInterface->SendMessageToConnection( conn, str, (uint32)strlen(str), k_nSteamNetworkingSend_Reliable, nullptr );
 	}
 
 	void SendStringToAllClients( const char *str, HSteamNetConnection except = k_HSteamNetConnection_Invalid )
@@ -392,12 +393,12 @@ private:
 			case k_ESteamNetworkingConnectionState_ClosedByPeer:
 			case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
 			{
-				// Ignore it they were not previously connected.  (If they disconnected
+				// Ignore if they were not previously connected.  (If they disconnected
 				// before we accepted the connection.)
 				if ( pInfo->m_eOldState == k_ESteamNetworkingConnectionState_Connected )
 				{
 
-					// Locate the client.  Note that it should have be found, because this
+					// Locate the client.  Note that it should have been found, because this
 					// is the only codepath where we remove clients (except on shutdown),
 					// and connection change callbacks are dispatched in queue order.
 					auto itClient = m_mapClients.find( pInfo->m_hConn );
@@ -532,7 +533,7 @@ public:
 		char szAddr[ SteamNetworkingIPAddr::k_cchMaxString ];
 		serverAddr.ToString( szAddr, sizeof(szAddr), true );
 		Printf( "Connecting to chat server at %s", szAddr );
-		m_hConnection = m_pInterface->ConnectByIPAddress( serverAddr );
+		m_hConnection = m_pInterface->ConnectByIPAddress( serverAddr, 0, nullptr );
 		if ( m_hConnection == k_HSteamNetConnection_Invalid )
 			FatalError( "Failed to create connection" );
 
@@ -595,7 +596,7 @@ private:
 			}
 
 			// Anything else, just send it to the server and let them parse it
-			m_pInterface->SendMessageToConnection( m_hConnection, cmd.c_str(), (uint32)cmd.length(), k_nSteamNetworkingSend_Reliable );
+			m_pInterface->SendMessageToConnection( m_hConnection, cmd.c_str(), (uint32)cmd.length(), k_nSteamNetworkingSend_Reliable, nullptr );
 		}
 	}
 

@@ -41,7 +41,7 @@ protected:
 // Base class for AES-GCM encryption and ddecryption
 class AES_GCM_CipherContext : public SymmetricCryptContextBase
 {
-protected:
+public:
 
 	// Initialize context with the specified private key, IV size, and tag size
 	bool InitCipher( const void *pKey, size_t cbKey, size_t cbIV, size_t cbTag, bool bEncrypt );
@@ -139,6 +139,10 @@ namespace CCrypto
 	bool Base64Decode( const char *pchEncodedData, void *pubDecodedData, uint32 *pcubDecodedData, bool bIgnoreInvalidCharacters = true ); // legacy, deprecated
 	bool Base64Decode( const char *pchEncodedData, uint32 cchEncodedData, void *pubDecodedData, uint32 *pcubDecodedData, bool bIgnoreInvalidCharacters = true );
 
+	/// Decode base64 into CUtlBuffer.  This precomputes the expetced size and does
+	/// only one allocation, so it's safe to use CAutoWipeBuffer.
+	bool DecodeBase64ToBuf( const char *pszEncoded, uint32 cbEncoded, CUtlBuffer &buf );
+
 	/// Parse a PEM-like thing, locating the hex-encoded body (but not parsing it.)
 	/// On success, will returns a pointer to the first character of the body,
 	/// and update *pcch to reflect its size.  You can then pass this
@@ -151,9 +155,13 @@ namespace CCrypto
 	/// then we just check that the header and footer contain something vaguely PEM-like.
 	const char *LocatePEMBody( const char *pchPEM, uint32 *pcch, const char *pszExpectedType );
 
+	/// Decode base-64 encoded PEM-like thing into buffer.  it's safe to use CAutoWipeBuffer
+	bool DecodePEMBody( const char *pszPem, uint32 cch, CUtlBuffer &buf, const char *pszExpectedType );
+
+	/// Use platform-dependency secure random number source of high entropy
 	void GenerateRandomBlock( void *pubDest, int cubDest );
 
-	void GenerateSHA256Digest( const uint8 *pubData, const int cubData, SHA256Digest_t *pOutputDigest );
+	void GenerateSHA256Digest( const void *pData, size_t cbData, SHA256Digest_t *pOutputDigest );
 
 	// GenerateHMAC256 is our implementation of HMAC-SHA256. Relatively future-proof. You should probably use this unless you have a very good reason not to.
 	void GenerateHMAC256( const uint8 *pubData, uint32 cubData, const uint8 *pubKey, uint32 cubKey, SHA256Digest_t *pOutputDigest );

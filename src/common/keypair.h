@@ -43,9 +43,6 @@ class CCryptoKeyBase
 public:
 	virtual ~CCryptoKeyBase();
 
-	bool operator==( const CCryptoKeyBase &rhs ) const;
-	bool operator!=( const CCryptoKeyBase &rhs ) const { return !operator==( rhs ); }
-
 	ECryptoKeyType GetKeyType() const { return m_eKeyType; }
 
 	// Return true if we're valid
@@ -57,9 +54,6 @@ public:
 	// Get raw data.  Returns number of bytes populated into the buffer.
 	// If you pass NULL, the number of bytes required is returned.
 	virtual uint32 GetRawData( void *pData ) const = 0;
-
-	// Get raw data as a std::string
-	bool GetRawDataAsStdString( std::string *pResult ) const;
 
 	// Set raw data.  Returns true on success.  Regardless of the outcome,
 	// your buffer will be wiped.
@@ -73,8 +67,22 @@ public:
 	bool SetFromHexEncodedString( const char *pchEncodedKey );
 	bool SetFromBase64EncodedString( const char *pchEncodedKey );
 
+	// Get raw data as a std::string
+	bool GetRawDataAsStdString( std::string *pResult ) const;
+
+	// Set raw data from a std::string.  (Useful for dealing with protobuf)
+	// NOTE: DOES NOT WIPE THE INPUT
+	bool SetRawDataFromStdString( const std::string &s ) { return SetRawDataWithoutWipingInput( s.c_str(), s.length() ); }
+
 	// Load from some sort of formatted buffer.  (Not the raw binary key data.)
 	virtual bool LoadFromAndWipeBuffer( void *pBuffer, size_t cBytes );
+
+	// Compare keys for equality, by comparing their raw data
+	bool operator==( const CCryptoKeyBase &rhs ) const;
+	bool operator!=( const CCryptoKeyBase &rhs ) const { return !operator==( rhs ); }
+
+	// Make a copy of the key, by using the raw data functions
+	bool CopyFrom( const CCryptoKeyBase &x );
 
 #ifdef DBGFLAG_VALIDATE
 	void Validate( CValidator &validator, const char *pchName ) const;		// Validate our internal structures

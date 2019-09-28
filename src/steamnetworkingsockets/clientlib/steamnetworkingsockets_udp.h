@@ -22,10 +22,10 @@ class CSteamNetworkListenSocketDirectUDP : public CSteamNetworkListenSocketBase
 public:
 	CSteamNetworkListenSocketDirectUDP( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface );
 	virtual ~CSteamNetworkListenSocketDirectUDP();
-	virtual bool APIGetAddress( SteamNetworkingIPAddr *pAddress ) OVERRIDE;
+	virtual bool APIGetAddress( SteamNetworkingIPAddr *pAddress ) override;
 
 	/// Setup
-	bool BInit( const SteamNetworkingIPAddr &localAddr, SteamDatagramErrMsg &errMsg );
+	bool BInit( const SteamNetworkingIPAddr &localAddr, int nOptions, const SteamNetworkingConfigValue_t *pOptions, SteamDatagramErrMsg &errMsg );
 
 private:
 
@@ -57,55 +57,38 @@ private:
 //
 /////////////////////////////////////////////////////////////////////////////
 
-/// A connection over raw UDP
-class CSteamNetworkConnectionUDP : public CSteamNetworkConnectionBase
+class CSteamNetworkConnectionUDP;
+
+/// Ordinary UDP transport
+class CConnectionTransportUDP final : public CConnectionTransport
 {
 public:
-	CSteamNetworkConnectionUDP( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface );
-	virtual ~CSteamNetworkConnectionUDP();
+	CConnectionTransportUDP( CSteamNetworkConnectionUDP &connection );
 
-	virtual void FreeResources() OVERRIDE;
-
-	/// Convenience wrapper to do the upcast, since we know what sort of
-	/// listen socket we were connected on.
-	inline CSteamNetworkListenSocketDirectUDP *ListenSocket() const { return assert_cast<CSteamNetworkListenSocketDirectUDP *>( m_pParentListenSocket ); }
-
-	/// Implements CSteamNetworkConnectionBase
-	virtual bool SendDataPacket( SteamNetworkingMicroseconds usecNow ) OVERRIDE;
-	virtual int SendEncryptedDataChunk( const void *pChunk, int cbChunk, SendPacketContext_t &ctx ) OVERRIDE;
-	virtual EResult APIAcceptConnection() OVERRIDE;
-	virtual bool BCanSendEndToEndConnectRequest() const OVERRIDE;
-	virtual bool BCanSendEndToEndData() const OVERRIDE;
-	virtual void SendEndToEndConnectRequest( SteamNetworkingMicroseconds usecNow ) OVERRIDE;
-	virtual void SendEndToEndStatsMsg( EStatsReplyRequest eRequest, SteamNetworkingMicroseconds usecNow, const char *pszReason ) OVERRIDE;
-	virtual void ThinkConnection( SteamNetworkingMicroseconds usecNow ) OVERRIDE;
-	virtual void GetConnectionTypeDescription( ConnectionTypeDescription_t &szDescription ) const OVERRIDE;
-	virtual ERemoteUnsignedCert AllowRemoteUnsignedCert() OVERRIDE;
-
-	/// Initiate a connection
-	bool BInitConnect( const SteamNetworkingIPAddr &addressRemote, SteamDatagramErrMsg &errMsg );
-
-	/// Accept a connection that has passed the handshake phase
-	bool BBeginAccept(
-		CSteamNetworkListenSocketDirectUDP *pParent,
-		const netadr_t &adrFrom,
-		CSharedSocket *pSharedSock,
-		const SteamNetworkingIdentity &identityRemote,
-		uint32 unConnectionIDRemote,
-		const CMsgSteamDatagramCertificateSigned &msgCert,
-		const CMsgSteamDatagramSessionCryptInfoSigned &msgSessionInfo,
-		SteamDatagramErrMsg &errMsg
-	);
-
-protected:
+	// Implements CSteamNetworkConnectionTransport
+	virtual void TransportFreeResources() override;
+	virtual bool SendDataPacket( SteamNetworkingMicroseconds usecNow ) override;
+	virtual int SendEncryptedDataChunk( const void *pChunk, int cbChunk, SendPacketContext_t &ctx ) override;
+	virtual bool BCanSendEndToEndConnectRequest() const override;
+	virtual bool BCanSendEndToEndData() const override;
+	virtual void SendEndToEndConnectRequest( SteamNetworkingMicroseconds usecNow ) override;
+	virtual void SendEndToEndStatsMsg( EStatsReplyRequest eRequest, SteamNetworkingMicroseconds usecNow, const char *pszReason ) override;
+	virtual void ConnectionStateChanged( ESteamNetworkingConnectionState eOldState ) override;
 
 	/// Interface used to talk to the remote host
 	IBoundUDPSocket *m_pSocket;
 
-	// We need to customize our thinking to handle the connection state machine
-	virtual void ConnectionStateChanged( ESteamNetworkingConnectionState eOldState ) OVERRIDE;
+	bool BConnect( const netadr_t &netadrRemote, SteamDatagramErrMsg &errMsg );
+	bool BAccept( CSharedSocket *pSharedSock, const netadr_t &netadrRemote, SteamDatagramErrMsg &errMsg );
 
-	static void PacketReceived( const void *pPkt, int cbPkt, const netadr_t &adrFrom, CSteamNetworkConnectionUDP *pSelf );
+	void SendConnectOK( SteamNetworkingMicroseconds usecNow );
+
+	static bool CreateLoopbackPair( CConnectionTransportUDP *pTransport[2] );
+
+protected:
+	virtual ~CConnectionTransportUDP(); // Don't call operator delete directly
+
+	static void PacketReceived( const void *pPkt, int cbPkt, const netadr_t &adrFrom, CConnectionTransportUDP *pSelf );
 
 	void Received_Data( const uint8 *pPkt, int cbPkt, SteamNetworkingMicroseconds usecNow );
 	void Received_ChallengeReply( const CMsgSteamSockets_UDP_ChallengeReply &msg, SteamNetworkingMicroseconds usecNow );
@@ -119,7 +102,6 @@ protected:
 	void SendPacket( const void *pkt, int cbPkt );
 	void SendPacketGather( int nChunks, const iovec *pChunks, int cbSendTotal );
 
-	void SendConnectOK( SteamNetworkingMicroseconds usecNow );
 	void SendConnectionClosedOrNoConnection();
 	void SendNoConnection( uint32 unFromConnectionID, uint32 unToConnectionID );
 
@@ -131,8 +113,44 @@ protected:
 	void PopulateSendPacketContext( UDPSendPacketContext_t &ctx, EStatsReplyRequest eReplyRequested );
 };
 
+/// A connection over ordinary UDP
+class CSteamNetworkConnectionUDP : public CSteamNetworkConnectionBase
+{
+public:
+	CSteamNetworkConnectionUDP( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface );
+
+	/// Convenience wrapper to do the upcast, since we know what sort of
+	/// listen socket we were connected on.
+	inline CSteamNetworkListenSocketDirectUDP *ListenSocket() const { return assert_cast<CSteamNetworkListenSocketDirectUDP *>( m_pParentListenSocket ); }
+	inline CConnectionTransportUDP *Transport() const { return assert_cast<CConnectionTransportUDP *>( m_pTransport ); }
+
+	/// Implements CSteamNetworkConnectionBase
+	virtual EResult AcceptConnection() override;
+	virtual void ThinkConnection( SteamNetworkingMicroseconds usecNow ) override;
+	virtual void GetConnectionTypeDescription( ConnectionTypeDescription_t &szDescription ) const override;
+	virtual EUnsignedCert AllowRemoteUnsignedCert() override;
+	virtual EUnsignedCert AllowLocalUnsignedCert() override;
+
+	/// Initiate a connection
+	bool BInitConnect( const SteamNetworkingIPAddr &addressRemote, int nOptions, const SteamNetworkingConfigValue_t *pOptions, SteamDatagramErrMsg &errMsg );
+
+	/// Accept a connection that has passed the handshake phase
+	bool BBeginAccept(
+		CSteamNetworkListenSocketDirectUDP *pParent,
+		const netadr_t &adrFrom,
+		CSharedSocket *pSharedSock,
+		const SteamNetworkingIdentity &identityRemote,
+		uint32 unConnectionIDRemote,
+		const CMsgSteamDatagramCertificateSigned &msgCert,
+		const CMsgSteamDatagramSessionCryptInfoSigned &msgSessionInfo,
+		SteamDatagramErrMsg &errMsg
+	);
+protected:
+	virtual ~CSteamNetworkConnectionUDP(); // Use ConnectionDestroySelfNow
+};
+
 /// A connection over loopback
-class CSteamNetworkConnectionlocalhostLoopback : public CSteamNetworkConnectionUDP
+class CSteamNetworkConnectionlocalhostLoopback final : public CSteamNetworkConnectionUDP
 {
 public:
 	CSteamNetworkConnectionlocalhostLoopback( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface, const SteamNetworkingIdentity &identity );
@@ -141,8 +159,9 @@ public:
 	static bool APICreateSocketPair( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface, CSteamNetworkConnectionlocalhostLoopback *pConn[2], const SteamNetworkingIdentity pIdentity[2] );
 
 	/// Base class overrides
-	virtual void PostConnectionStateChangedCallback( ESteamNetworkingConnectionState eOldAPIState, ESteamNetworkingConnectionState eNewAPIState ) OVERRIDE;
-	virtual void InitConnectionCrypto( SteamNetworkingMicroseconds usecNow ) OVERRIDE;
+	virtual void PostConnectionStateChangedCallback( ESteamNetworkingConnectionState eOldAPIState, ESteamNetworkingConnectionState eNewAPIState ) override;
+	virtual EUnsignedCert AllowRemoteUnsignedCert() override;
+	virtual EUnsignedCert AllowLocalUnsignedCert() override;
 };
 
 } // namespace SteamNetworkingSocketsLib

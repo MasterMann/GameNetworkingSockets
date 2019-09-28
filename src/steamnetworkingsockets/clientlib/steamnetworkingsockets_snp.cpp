@@ -9,13 +9,6 @@
 #include <steam/isteamnetworking.h>
 #endif
 
-// Ug
-#ifdef _MSC_VER
-	#if _MSC_VER < 1900
-		#define constexpr const
-	#endif
-#endif
-
 // Acks may be delayed.  This controls the precision used on the wire to encode the delay time.
 constexpr int k_nAckDelayPrecisionShift = 5;
 constexpr SteamNetworkingMicroseconds k_usecAckDelayPrecision = (1 << k_nAckDelayPrecisionShift );
@@ -123,7 +116,7 @@ int TFRCCalcX( int s, SteamNetworkingMicroseconds rtt, float p )
 	// b is TCP acknowlege packet rate, assumed to be 1 for this implementation
 
 	float R = (double)rtt / k_nMillion;
-	float t_RTO = MAX( 4 * R, 1.0f );
+	float t_RTO = std::max( 4 * R, 1.0f );
 
 	return static_cast< int >( static_cast<float>( s ) /
 		( R * sqrt( 2 * p / 3 ) + ( t_RTO * ( 3 * sqrt( 3 * p / 8 ) * p * ( 1 + 32 * ( p * p ) ) ) ) ) );
@@ -142,12 +135,16 @@ inline SteamNetworkingMicroseconds GetUsecPingWithFallback( CSteamNetworkConnect
 	return nPingMS*1000;
 }
 
-void SSNPSenderState::Reset()
+
+void SSNPSenderState::Shutdown()
 {
-	while ( !m_unackedReliableMessages.empty() )
-	{
-		delete m_unackedReliableMessages.pop_front();
-	}
+	m_unackedReliableMessages.PurgeMessages();
+	m_messagesQueued.PurgeMessages();
+	m_mapInFlightPacketsByPktNum.clear();
+	m_listInFlightReliableRange.clear();
+	m_cbPendingUnreliable = 0;
+	m_cbPendingReliable = 0;
+	m_cbSentUnackedReliable = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -161,16 +158,16 @@ void SSNPSenderState::RemoveAckedReliableMessageFromUnackedList()
 	// messages have been acked.
 	while ( !m_unackedReliableMessages.empty() )
 	{
-		SNPSendMessage_t *pMsg = m_unackedReliableMessages.m_pFirst;
-		Assert( pMsg->m_nReliableStreamPos > 0 );
-		int64 nReliableEnd = pMsg->m_nReliableStreamPos + pMsg->m_cbSize;
+		CSteamNetworkingMessage *pMsg = m_unackedReliableMessages.m_pFirst;
+		Assert( pMsg->SNPSend_ReliableStreamPos() > 0 );
+		int64 nReliableEnd = pMsg->SNPSend_ReliableStreamPos() + pMsg->m_cbSize;
 
 		// Are we backing a range that is in flight (and thus we might need
 		// to resend?)
 		if ( !m_listInFlightReliableRange.empty() )
 		{
 			auto head = m_listInFlightReliableRange.begin();
-			Assert( head->first.m_nBegin >= pMsg->m_nReliableStreamPos );
+			Assert( head->first.m_nBegin >= pMsg->SNPSend_ReliableStreamPos() );
 			if ( head->second == pMsg )
 			{
 				Assert( head->first.m_nBegin < nReliableEnd );
@@ -183,7 +180,7 @@ void SSNPSenderState::RemoveAckedReliableMessageFromUnackedList()
 		if ( !m_listReadyRetryReliableRange.empty() )
 		{
 			auto head = m_listReadyRetryReliableRange.begin();
-			Assert( head->first.m_nBegin >= pMsg->m_nReliableStreamPos );
+			Assert( head->first.m_nBegin >= pMsg->SNPSend_ReliableStreamPos() );
 			if ( head->second == pMsg )
 			{
 				Assert( head->first.m_nBegin < nReliableEnd );
@@ -194,7 +191,7 @@ void SSNPSenderState::RemoveAckedReliableMessageFromUnackedList()
 
 		// We're all done!
 		DbgVerify( m_unackedReliableMessages.pop_front() == pMsg );
-		delete pMsg;
+		pMsg->Release();
 	}
 }
 
@@ -213,7 +210,6 @@ SSNPSenderState::SSNPSenderState()
 SSNPReceiverState::SSNPReceiverState()
 {
 	// Init packet gaps with a sentinel
-	m_mapPacketGaps.clear();
 	SSNPPacketGap &sentinel = m_mapPacketGaps[INT64_MAX];
 	sentinel.m_nEnd = INT64_MAX; // Fixed value
 	sentinel.m_usecWhenOKToNack = INT64_MAX; // Fixed value, for when there is nothing left to nack
@@ -223,6 +219,15 @@ SSNPReceiverState::SSNPReceiverState()
 	m_itPendingAck = m_mapPacketGaps.end();
 	--m_itPendingAck;
 	m_itPendingNack = m_itPendingAck;
+}
+
+//-----------------------------------------------------------------------------
+void SSNPReceiverState::Shutdown()
+{
+	m_mapUnreliableSegments.clear();
+	m_bufReliableStream.clear();
+	m_mapReliableStreamGaps.clear();
+	m_mapPacketGaps.clear();
 }
 
 //-----------------------------------------------------------------------------
@@ -249,23 +254,37 @@ void CSteamNetworkConnectionBase::SNP_InitializeConnection( SteamNetworkingMicro
 }
 
 //-----------------------------------------------------------------------------
-EResult CSteamNetworkConnectionBase::SNP_SendMessage( SteamNetworkingMicroseconds usecNow, const void *pData, int cbData, int nSendFlags )
+void CSteamNetworkConnectionBase::SNP_ShutdownConnection()
 {
+	m_senderState.Shutdown();
+	m_receiverState.Shutdown();
+}
+
+//-----------------------------------------------------------------------------
+int64 CSteamNetworkConnectionBase::SNP_SendMessage( CSteamNetworkingMessage *pSendMessage, SteamNetworkingMicroseconds usecNow, bool *pbThinkImmediately )
+{
+	int cbData = (int)pSendMessage->m_cbSize;
+
+	// Assume we won't want to wake up immediately
+	if ( pbThinkImmediately )
+		*pbThinkImmediately = false;
+
 	// Check if we're full
-	if ( m_senderState.PendingBytesTotal() + (int)cbData > m_connectionConfig.m_SendBufferSize.Get() )
+	if ( m_senderState.PendingBytesTotal() + cbData > m_connectionConfig.m_SendBufferSize.Get() )
 	{
 		SpewWarning( "Connection already has %u bytes pending, cannot queue any more messages\n", m_senderState.PendingBytesTotal() );
-		return k_EResultLimitExceeded; 
+		pSendMessage->Release();
+		return -k_EResultLimitExceeded; 
 	}
 
 	// Check if they try to send a really large message
-	if ( cbData > k_cbMaxUnreliableMsgSize && !( nSendFlags & k_nSteamNetworkingSend_Reliable )  )
+	if ( cbData > k_cbMaxUnreliableMsgSize && !( pSendMessage->m_nFlags & k_nSteamNetworkingSend_Reliable )  )
 	{
 		SpewWarningRateLimited( usecNow, "Trying to send a very large (%d bytes) unreliable message.  Sending as reliable instead.\n", cbData );
-		nSendFlags |= k_nSteamNetworkingSend_Reliable;
+		pSendMessage->m_nFlags |= k_nSteamNetworkingSend_Reliable;
 	}
 
-	if ( nSendFlags & k_nSteamNetworkingSend_NoDelay )
+	if ( pSendMessage->m_nFlags & k_nSteamNetworkingSend_NoDelay )
 	{
 		// FIXME - need to check how much data is currently pending, and return
 		// k_EResultIgnored if we think it's going to be a while before this
@@ -277,22 +296,19 @@ EResult CSteamNetworkConnectionBase::SNP_SendMessage( SteamNetworkingMicrosecond
 	SNP_ClampSendRate();
 	SNP_TokenBucket_Accumulate( usecNow );
 
-	// Add to the send queue
-	SNPSendMessage_t *pSendMessage = new SNPSendMessage_t();
-
-	// Assign message number
-	pSendMessage->m_nMsgNum = ++m_senderState.m_nLastSentMsgNum;
+	// Assign a message number
+	pSendMessage->m_nMessageNumber = ++m_senderState.m_nLastSentMsgNum;
 
 	// Reliable, or unreliable?
-	if ( nSendFlags & k_nSteamNetworkingSend_Reliable )
+	if ( pSendMessage->m_nFlags & k_nSteamNetworkingSend_Reliable )
 	{
-		pSendMessage->m_nReliableStreamPos = m_senderState.m_nReliableStreamPos;
+		pSendMessage->SNPSend_SetReliableStreamPos( m_senderState.m_nReliableStreamPos );
 
 		// Generate the header
-		byte hdr[ 32 ];
+		byte *hdr = pSendMessage->SNPSend_ReliableHeader();
 		hdr[0] = 0;
 		byte *hdrEnd = hdr+1;
-		int64 nMsgNumGap = pSendMessage->m_nMsgNum - m_senderState.m_nLastSendMsgNumReliable;
+		int64 nMsgNumGap = pSendMessage->m_nMessageNumber - m_senderState.m_nLastSendMsgNumReliable;
 		Assert( nMsgNumGap >= 1 );
 		if ( nMsgNumGap > 1 )
 		{
@@ -308,13 +324,10 @@ EResult CSteamNetworkConnectionBase::SNP_SendMessage( SteamNetworkingMicrosecond
 			hdr[0] |= (byte)( 0x20 | ( cbData & 0x1f ) );
 			hdrEnd = SerializeVarInt( hdrEnd, cbData>>5U );
 		}
-		int cbHdr = hdrEnd - hdr;
+		pSendMessage->m_cbSNPSendReliableHeader = hdrEnd - hdr;
 
-		// Copy the data into the message, with the header prepended
-		pSendMessage->m_cbSize = cbHdr+cbData;
-		pSendMessage->m_pData = new uint8[ pSendMessage->m_cbSize ];
-		memcpy( pSendMessage->m_pData, hdr, cbHdr );
-		memcpy( pSendMessage->m_pData+cbHdr, pData, cbData );
+		// Grow the total size of the message by the header
+		pSendMessage->m_cbSize += pSendMessage->m_cbSNPSendReliableHeader;
 
 		// Advance stream pointer
 		m_senderState.m_nReliableStreamPos += pSendMessage->m_cbSize;
@@ -325,63 +338,101 @@ EResult CSteamNetworkConnectionBase::SNP_SendMessage( SteamNetworkingMicrosecond
 
 		// Remember last sent reliable message number, so we can know how to
 		// encode the next one
-		m_senderState.m_nLastSendMsgNumReliable = pSendMessage->m_nMsgNum;
+		m_senderState.m_nLastSendMsgNumReliable = pSendMessage->m_nMessageNumber;
+
+		Assert( pSendMessage->SNPSend_IsReliable() );
 	}
 	else
 	{
-
-		// Just copy the data
-		pSendMessage->m_pData = new uint8[ cbData ];
-		pSendMessage->m_cbSize = cbData;
-		memcpy( pSendMessage->m_pData, pData, cbData );
-
-		pSendMessage->m_nReliableStreamPos = 0;
+		pSendMessage->SNPSend_SetReliableStreamPos( 0 );
+		pSendMessage->m_cbSNPSendReliableHeader = 0;
 
 		++m_senderState.m_nMessagesSentUnreliable;
 		m_senderState.m_cbPendingUnreliable += pSendMessage->m_cbSize;
+
+		Assert( !pSendMessage->SNPSend_IsReliable() );
 	}
 
 	// Add to pending list
 	m_senderState.m_messagesQueued.push_back( pSendMessage );
 	SpewType( m_connectionConfig.m_LogLevel_Message.Get(), "[%s] SendMessage %s: MsgNum=%lld sz=%d\n",
 				 GetDescription(),
-				 ( nSendFlags & k_nSteamNetworkingSend_Reliable ) ? "RELIABLE" : "UNRELIABLE",
-				 (long long)pSendMessage->m_nMsgNum,
+				 pSendMessage->SNPSend_IsReliable() ? "RELIABLE" : "UNRELIABLE",
+				 (long long)pSendMessage->m_nMessageNumber,
 				 pSendMessage->m_cbSize );
 
 	// Use Nagle?
 	// We always set the Nagle timer, even if we immediately clear it.  This makes our clearing code simpler,
 	// since we can always safely assume that once we find a message with the nagle timer cleared, all messages
 	// queued earlier than this also have it cleared.
-	pSendMessage->m_usecNagle = usecNow + m_connectionConfig.m_NagleTime.Get();
-	if ( nSendFlags & k_nSteamNetworkingSend_NoNagle )
+	// FIXME - Don't think this works if the configuration value is changing.  Since changing the
+	// config value could violate the assumption that nagle times are increasing.  Probably not worth
+	// fixing.
+	pSendMessage->SNPSend_SetUsecNagle( usecNow + m_connectionConfig.m_NagleTime.Get() );
+	if ( pSendMessage->m_nFlags & k_nSteamNetworkingSend_NoNagle )
 		m_senderState.ClearNagleTimers();
+
+	// Save the message number.  The code below might end up deleting the message we just queued
+	int64 result = pSendMessage->m_nMessageNumber;
 
 	// Schedule wakeup at the appropriate time.  (E.g. right now, if we're ready to send, 
 	// or at the Nagle time, if Nagle is active.)
+	//
+	// NOTE: Right now we might not actually be capable of sending end to end data.
+	// But that case is relatievly rare, and nothing will break if we try to right now.
+	// On the other hand, just asking the question involved a virtual function call,
+	// and it will return success most of the time, so let's not make the check here.
 	if ( GetState() == k_ESteamNetworkingConnectionState_Connected )
 	{
 		SteamNetworkingMicroseconds usecNextThink = SNP_GetNextThinkTime( usecNow );
 
-		// If we are rate limiting, spew about it
-		if ( m_senderState.m_messagesQueued.m_pFirst->m_usecNagle == 0 && usecNextThink > usecNow )
+		// Ready to send now?
+		if ( usecNextThink > usecNow )
 		{
-			SpewVerbose( "[%s] RATELIM QueueTime is %.1fms, SendRate=%.1fk, BytesQueued=%d\n", 
-				GetDescription(),
-				m_senderState.CalcTimeUntilNextSend() * 1e-3,
-				m_senderState.m_n_x * ( 1.0/1024.0),
-				m_senderState.PendingBytesTotal()
-			);
-		}
 
-		// Set a wakeup call.  If this is newer than the next time anything else needs to
-		// wake up (e.g. the important case of "ASAP"), then it will trigger the service
-		// thread to wake up, and so if we are ready to send packets right now, it should
-		// begin very soon in the other thread, as soon as this thread releases the lock
-		EnsureMinThinkTime( usecNextThink, +1 );
+			// We are rate limiting.  Spew about it?
+			if ( m_senderState.m_messagesQueued.m_pFirst->SNPSend_UsecNagle() == 0 )
+			{
+				SpewVerbose( "[%s] RATELIM QueueTime is %.1fms, SendRate=%.1fk, BytesQueued=%d\n", 
+					GetDescription(),
+					m_senderState.CalcTimeUntilNextSend() * 1e-3,
+					m_senderState.m_n_x * ( 1.0/1024.0),
+					m_senderState.PendingBytesTotal()
+				);
+			}
+
+			// Set a wakeup call.
+			EnsureMinThinkTime( usecNextThink, +1 );
+		}
+		else
+		{
+
+			// We're ready to send right now.  Check if we should!
+			if ( pSendMessage->m_nFlags & k_nSteamNetworkingSend_UseCurrentThread )
+			{
+
+				// We should send in this thread, before the API entry point
+				// that the app used returns.  Is the caller gonna handle this?
+				if ( pbThinkImmediately )
+				{
+					// Caller says they will handle it
+					*pbThinkImmediately = true;
+				}
+				else
+				{
+					// Caller wants us to just do it here.
+					CheckConnectionStateAndSetNextThinkTime( usecNow );
+				}
+			}
+			else
+			{
+				// Wake up the service thread ASAP to send this in the background thread
+				SetNextThinkTimeASAP();
+			}
+		}
 	}
 
-	return k_EResultOK;
+	return result;
 }
 
 EResult CSteamNetworkConnectionBase::SNP_FlushMessage( SteamNetworkingMicroseconds usecNow )
@@ -399,7 +450,7 @@ EResult CSteamNetworkConnectionBase::SNP_FlushMessage( SteamNetworkingMicrosecon
 
 	// If no Nagle timer was set, then there's nothing to do, we should already
 	// be properly scheduled.  Don't do work to re-discover that fact.
-	if ( m_senderState.m_messagesQueued.m_pLast->m_usecNagle == 0 )
+	if ( m_senderState.m_messagesQueued.m_pLast->SNPSend_UsecNagle() == 0 )
 		return k_EResultOK;
 
 	// Accumulate tokens, and also limit to reasonable burst
@@ -452,7 +503,7 @@ bool CSteamNetworkConnectionBase::SNP_RecvDataChunk( int64 nPktNum, const void *
 		} while(false)
 
 	#define READ_64BITU( var, pszWhatFor ) \
-		do { EXPECT_BYTES(8,pszWhatFor); var = LittleQWord(*(uint64 *)pDecode); pDecode += 2; } while(false)
+		do { EXPECT_BYTES(8,pszWhatFor); var = LittleQWord(*(uint64 *)pDecode); pDecode += 8; } while(false)
 
 	#define READ_VARINT( var, pszWhatFor ) \
 		do { pDecode = DeserializeVarInt( pDecode, pEnd, var ); if ( !pDecode ) { DECODE_ERROR( "SNP data chunk decode overflow, varint for %s", pszWhatFor ); } } while(false)
@@ -807,12 +858,12 @@ bool CSteamNetworkConnectionBase::SNP_RecvDataChunk( int64 nPktNum, const void *
 					// occasionally send pings that require an immediately reply, and
 					// if those ping times seem way out of whack with the ones where they are
 					// allowed to send a delay, take action against them.
-					if ( msPing < -1 )
+					if ( msPing < -1 || msPing > 2000 )
 					{
 						// Either they are lying or some weird timer stuff is happening.
 						// Either way, discard it.
 
-						SpewType( m_connectionConfig.m_LogLevel_AckRTT.Get(), "[%s] decode pkt %lld latest recv %lld delay %lluusec INVALID ping %lldusec\n",
+						SpewType( m_connectionConfig.m_LogLevel_AckRTT.Get()-1, "[%s] decode pkt %lld latest recv %lld delay %lluusec INVALID ping %lldusec\n",
 							GetDescription(),
 							(long long)nPktNum, (long long)nLatestRecvSeqNum,
 							(unsigned long long)usecDelay,
@@ -827,11 +878,12 @@ bool CSteamNetworkConnectionBase::SNP_RecvDataChunk( int64 nPktNum, const void *
 						m_statsEndToEnd.m_ping.ReceivedPing( msPing, usecNow );
 
 						// Spew
-						SpewType( m_connectionConfig.m_LogLevel_AckRTT.Get(), "[%s] decode pkt %lld latest recv %lld delay %.1fms ping %.1fms\n",
+						SpewType( m_connectionConfig.m_LogLevel_AckRTT.Get(), "[%s] decode pkt %lld latest recv %lld delay %.1fms elapsed %.1fms ping %dms\n",
 							GetDescription(),
 							(long long)nPktNum, (long long)nLatestRecvSeqNum,
 							(float)(usecDelay * 1e-3 ),
-							(float)(usecElapsed * 1e-3 )
+							(float)(usecElapsed * 1e-3 ),
+							msPing
 						);
 					}
 				}
@@ -1159,15 +1211,15 @@ struct EncodedSegment
 	static constexpr int k_cbMaxHdr = 16; 
 	uint8 m_hdr[ k_cbMaxHdr ];
 	int m_cbHdr; // Doesn't include any size byte
-	SNPSendMessage_t *m_pMsg;
-	int m_cbSize;
+	CSteamNetworkingMessage *m_pMsg;
+	int m_cbSegSize;
 	int m_nOffset;
 
-	inline void SetupReliable( SNPSendMessage_t *pMsg, int64 nBegin, int64 nEnd, int64 nLastReliableStreamPosEnd )
+	inline void SetupReliable( CSteamNetworkingMessage *pMsg, int64 nBegin, int64 nEnd, int64 nLastReliableStreamPosEnd )
 	{
 		Assert( nBegin < nEnd );
-		Assert( nBegin + k_cbSteamNetworkingSocketsMaxReliableMessageSegment >= nEnd ); // Max sure we don't exceed max segment size
-		Assert( pMsg->m_cbSize > 0 );
+		//Assert( nBegin + k_cbSteamNetworkingSocketsMaxReliableMessageSegment >= nEnd ); // Max sure we don't exceed max segment size
+		Assert( pMsg->SNPSend_IsReliable() );
 
 		// Start filling out the header with the top three bits = 010,
 		// identifying this as a reliable segment
@@ -1215,15 +1267,15 @@ struct EncodedSegment
 		// even though it might need to get truncated
 		int cbSegData = nEnd - nBegin;
 		Assert( cbSegData > 0 );
-		Assert( nBegin >= pMsg->m_nReliableStreamPos );
-		Assert( nEnd <= pMsg->m_nReliableStreamPos + pMsg->m_cbSize );
+		Assert( nBegin >= pMsg->SNPSend_ReliableStreamPos() );
+		Assert( nEnd <= pMsg->SNPSend_ReliableStreamPos() + pMsg->m_cbSize );
 
 		m_pMsg = pMsg;
-		m_nOffset = nBegin - pMsg->m_nReliableStreamPos;
-		m_cbSize = cbSegData;
+		m_nOffset = nBegin - pMsg->SNPSend_ReliableStreamPos();
+		m_cbSegSize = cbSegData;
 	}
 
-	inline void SetupUnreliable( SNPSendMessage_t *pMsg, int nOffset, int64 nLastMsgNum )
+	inline void SetupUnreliable( CSteamNetworkingMessage *pMsg, int nOffset, int64 nLastMsgNum )
 	{
 
 		// Start filling out the header with the top two bits = 00,
@@ -1237,14 +1289,14 @@ struct EncodedSegment
 
 			// Just always encode message number with 32 bits for now,
 			// to make sure we are hitting the worst case.  We can optimize this later
-			*(uint32*)pHdr = LittleWord( (uint32)pMsg->m_nMsgNum ); pHdr += 4;
+			*(uint32*)pHdr = LittleDWord( (uint32)pMsg->m_nMessageNumber ); pHdr += 4;
 			m_hdr[0] |= 0x10;
 		}
 		else
 		{
 			// Subsequent unreliable message
-			Assert( pMsg->m_nMsgNum > nLastMsgNum );
-			uint64 nDelta = pMsg->m_nMsgNum - nLastMsgNum;
+			Assert( pMsg->m_nMessageNumber > nLastMsgNum );
+			uint64 nDelta = pMsg->m_nMessageNumber - nLastMsgNum;
 			if ( nDelta == 1 )
 			{
 				// Common case of sequential messages.  Don't encode any offset
@@ -1272,7 +1324,7 @@ struct EncodedSegment
 		Assert( cbSegData > 0 || ( cbSegData == 0 && pMsg->m_cbSize == 0 ) ); // We should only send zero-byte segments if the message itself is zero bytes.  (Which is legitimate!)
 
 		m_pMsg = pMsg;
-		m_cbSize = cbSegData;
+		m_cbSegSize = cbSegData;
 		m_nOffset = nOffset;
 	}
 
@@ -1305,12 +1357,20 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 	Assert( BStateIsConnectedForWirePurposes() );
 	Assert( !m_senderState.m_mapInFlightPacketsByPktNum.empty() );
 
+	// We must have transport!
+	if ( !m_pTransport )
+	{
+		Assert( false );
+		return false;
+	}
+
 	SteamNetworkingMicroseconds usecNow = ctx.m_usecNow;
 
 	// Get max size of plaintext we could send.
 	// AES-GCM has a fixed size overhead, for the tag.
+	// FIXME - but what we if we aren't using AES-GCM!
 	int cbMaxPlaintextPayload = std::max( 0, ctx.m_cbMaxEncryptedPayload-k_cbSteamNetwokingSocketsEncrytionTagSize );
-	cbMaxPlaintextPayload = std::min( cbMaxPlaintextPayload, k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend );
+	cbMaxPlaintextPayload = std::min( cbMaxPlaintextPayload, m_cbMaxPlaintextPayloadSend );
 
 	uint8 payload[ k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend ];
 	uint8 *pPayloadEnd = payload + cbMaxPlaintextPayload;
@@ -1404,7 +1464,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 		// Start a reliable segment
 		EncodedSegment &seg = *push_back_get_ptr( vecSegments );
 		seg.SetupReliable( h->second, h->first.m_nBegin, h->first.m_nEnd, nLastReliableStreamPosEnd );
-		int cbSegTotalWithoutSizeField = seg.m_cbHdr + seg.m_cbSize;
+		int cbSegTotalWithoutSizeField = seg.m_cbHdr + seg.m_cbSegSize;
 		if ( cbSegTotalWithoutSizeField > cbBytesRemainingForSegments )
 		{
 			// This one won't fit.
@@ -1425,7 +1485,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			// we will never make progress and we are hosed!
 			AssertMsg2(
 				nLastReliableStreamPosEnd > 0
-				|| cbMaxPlaintextPayload < k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend
+				|| cbMaxPlaintextPayload < m_cbMaxPlaintextPayloadSend
 				|| ( cbReserveForAcks > 15 && ackHelper.m_nBlocksNeedToAck > 8 ),
 				"We cannot fit reliable segment, need %d bytes, only %d remaining", cbSegTotalWithoutSizeField, cbBytesRemainingForSegments
 			);
@@ -1469,7 +1529,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 				m_senderState.m_cbCurrentSendMessageSent = 0;
 				break;
 			}
-			SNPSendMessage_t *pSendMsg = m_senderState.m_messagesQueued.m_pFirst;
+			CSteamNetworkingMessage *pSendMsg = m_senderState.m_messagesQueued.m_pFirst;
 			Assert( m_senderState.m_cbCurrentSendMessageSent < pSendMsg->m_cbSize );
 
 			// Start a new segment
@@ -1477,12 +1537,12 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 
 			// Reliable?
 			bool bLastSegment = false;
-			if ( pSendMsg->m_nReliableStreamPos )
+			if ( pSendMsg->SNPSend_IsReliable() )
 			{
 
 				// FIXME - Coalesce adjacent reliable messages ranges
 
-				int64 nBegin = pSendMsg->m_nReliableStreamPos + m_senderState.m_cbCurrentSendMessageSent;
+				int64 nBegin = pSendMsg->SNPSend_ReliableStreamPos() + m_senderState.m_cbCurrentSendMessageSent;
 
 				// How large would we like this segment to be,
 				// ignoring how much space is left in the packet.
@@ -1490,9 +1550,9 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 				// sure that we don't make an excessively large
 				// one and then have a hard time retrying it later.
 				int cbDesiredSegSize = pSendMsg->m_cbSize - m_senderState.m_cbCurrentSendMessageSent;
-				if ( cbDesiredSegSize > k_cbSteamNetworkingSocketsMaxReliableMessageSegment )
+				if ( cbDesiredSegSize > m_cbMaxReliableMessageSegment )
 				{
-					cbDesiredSegSize = k_cbSteamNetworkingSocketsMaxReliableMessageSegment;
+					cbDesiredSegSize = m_cbMaxReliableMessageSegment;
 					bLastSegment = true;
 				}
 
@@ -1508,7 +1568,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			}
 
 			// Can't fit the whole thing?
-			if ( bLastSegment || seg.m_cbHdr + seg.m_cbSize > cbBytesRemainingForSegments )
+			if ( bLastSegment || seg.m_cbHdr + seg.m_cbSegSize > cbBytesRemainingForSegments )
 			{
 
 				// Check if we have enough room to send anything worthwhile.
@@ -1517,7 +1577,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 				// just as much as the total number of bytes, so if we're going to have to send another packet
 				// anyway, don't send a little sliver of a message at the beginning of a packet
 				// We need to finish the header by this point if we're going to send anything
-				int cbMinSegDataSizeToSend = std::min( 16, seg.m_cbSize );
+				int cbMinSegDataSizeToSend = std::min( 16, seg.m_cbSegSize );
 				if ( seg.m_cbHdr + cbMinSegDataSizeToSend > cbBytesRemainingForSegments )
 				{
 					// Don't send this segment now.
@@ -1530,16 +1590,16 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 				#endif
 
 				// Truncate, and leave the message in the queue
-				seg.m_cbSize = std::min( seg.m_cbSize, cbBytesRemainingForSegments - seg.m_cbHdr );
-				m_senderState.m_cbCurrentSendMessageSent += seg.m_cbSize;
+				seg.m_cbSegSize = std::min( seg.m_cbSegSize, cbBytesRemainingForSegments - seg.m_cbHdr );
+				m_senderState.m_cbCurrentSendMessageSent += seg.m_cbSegSize;
 				Assert( m_senderState.m_cbCurrentSendMessageSent < pSendMsg->m_cbSize );
-				cbBytesRemainingForSegments -= seg.m_cbHdr + seg.m_cbSize;
+				cbBytesRemainingForSegments -= seg.m_cbHdr + seg.m_cbSegSize;
 				break;
 			}
 
 			// The whole message fit (perhaps exactly, without the size byte)
 			// Reset send pointer for the next message
-			Assert( m_senderState.m_cbCurrentSendMessageSent + seg.m_cbSize == pSendMsg->m_cbSize );
+			Assert( m_senderState.m_cbCurrentSendMessageSent + seg.m_cbSegSize == pSendMsg->m_cbSize );
 			m_senderState.m_cbCurrentSendMessageSent = 0;
 
 			// Remove message from queue,w e have transfered ownership to the segment and will
@@ -1547,7 +1607,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			m_senderState.m_messagesQueued.pop_front();
 
 			// Consume payload bytes
-			cbBytesRemainingForSegments -= seg.m_cbHdr + seg.m_cbSize;
+			cbBytesRemainingForSegments -= seg.m_cbHdr + seg.m_cbSegSize;
 
 			// Assume for now this won't be the last segment, in which case we will also need the byte for the size field.
 			// NOTE: This might cause cbPayloadBytesRemaining to go negative by one!  I know that seems weird, but it actually
@@ -1555,7 +1615,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			cbBytesRemainingForSegments -= 1;
 
 			// Update various accounting, depending on reliable or unreliable
-			if ( pSendMsg->m_nReliableStreamPos > 0 )
+			if ( pSendMsg->SNPSend_IsReliable() )
 			{
 				// Reliable segments advance the current message number.
 				// NOTE: If we coalesce adjacent reliable segments, this will probably need to be adjusted
@@ -1567,7 +1627,7 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			}
 			else
 			{
-				nLastMsgNum = pSendMsg->m_nMsgNum;
+				nLastMsgNum = pSendMsg->m_nMessageNumber;
 
 				// Set the "This is the last segment in this message" header bit
 				seg.m_hdr[0] |= 0x20;
@@ -1635,12 +1695,12 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 		if ( idx < nSegments-1 )
 		{
 			// Stash upper 3 bits into the header
-			int nUpper3Bits = ( seg.m_cbSize>>8 );
+			int nUpper3Bits = ( seg.m_cbSegSize>>8 );
 			Assert( nUpper3Bits <= 4 ); // The values 5 and 6 are reserved and shouldn't be needed due to the MTU we support
 			seg.m_hdr[0] |= nUpper3Bits;
 
 			// And the lower 8 bits follow the other fields
-			seg.m_hdr[ seg.m_cbHdr++ ] = uint8( seg.m_cbSize );
+			seg.m_hdr[ seg.m_cbHdr++ ] = uint8( seg.m_cbSegSize );
 		}
 		else
 		{
@@ -1653,22 +1713,43 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 
 		// Copy the header
 		memcpy( pPayloadPtr, seg.m_hdr, seg.m_cbHdr ); pPayloadPtr += seg.m_cbHdr;
-
-		// Copy the data
-		Assert( pPayloadPtr+seg.m_cbSize <= pPayloadEnd );
-		memcpy( pPayloadPtr, seg.m_pMsg->m_pData + seg.m_nOffset, seg.m_cbSize ); pPayloadPtr += seg.m_cbSize;
+		Assert( pPayloadPtr+seg.m_cbSegSize <= pPayloadEnd );
 
 		// Reliable?
-		if ( seg.m_pMsg->m_nReliableStreamPos > 0 )
+		if ( seg.m_pMsg->SNPSend_IsReliable() )
 		{
 			// We should never encode an empty range of the stream, that is worthless.
 			// (Even an empty reliable message requires some framing in the stream.)
-			Assert( seg.m_cbSize > 0 );
+			Assert( seg.m_cbSegSize > 0 );
+
+			// Copy the unreliable segment into the packet.  Does the portion we are serializing
+			// begin in the header?
+			if ( seg.m_nOffset < seg.m_pMsg->m_cbSNPSendReliableHeader )
+			{
+				int cbCopyHdr = std::min( seg.m_cbSegSize, seg.m_pMsg->m_cbSNPSendReliableHeader - seg.m_nOffset );
+
+				memcpy( pPayloadPtr, seg.m_pMsg->SNPSend_ReliableHeader() + seg.m_nOffset, cbCopyHdr );
+				pPayloadPtr += cbCopyHdr;
+
+				int cbCopyBody = seg.m_cbSegSize - cbCopyHdr;
+				if ( cbCopyBody > 0 )
+				{
+					memcpy( pPayloadPtr, seg.m_pMsg->m_pData, cbCopyBody );
+					pPayloadPtr += cbCopyBody;
+				}
+			}
+			else
+			{
+				// This segment is entirely from the message body
+				memcpy( pPayloadPtr, (char*)seg.m_pMsg->m_pData + seg.m_nOffset - seg.m_pMsg->m_cbSNPSendReliableHeader, seg.m_cbSegSize );
+				pPayloadPtr += seg.m_cbSegSize;
+			}
+
 
 			// Remember that this range is in-flight
 			SNPRange_t range;
-			range.m_nBegin = seg.m_pMsg->m_nReliableStreamPos + seg.m_nOffset;
-			range.m_nEnd = range.m_nBegin + seg.m_cbSize;
+			range.m_nBegin = seg.m_pMsg->SNPSend_ReliableStreamPos() + seg.m_nOffset;
+			range.m_nEnd = range.m_nBegin + seg.m_cbSegSize;
 
 			// Ranges of the reliable stream that have not been acked should either be
 			// in flight, or queued for retry.  Make sure this range is not already in
@@ -1678,8 +1759,8 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 
 			// Spew
 			SpewType( nLogLevelPacketDecode+1, "[%s]   encode pkt %lld reliable msg %lld offset %d+%d=%d range [%lld,%lld)\n",
-				GetDescription(), (long long)m_statsEndToEnd.m_nNextSendSequenceNumber, (long long)seg.m_pMsg->m_nMsgNum,
-				seg.m_nOffset, seg.m_cbSize, seg.m_nOffset+seg.m_cbSize,
+				GetDescription(), (long long)m_statsEndToEnd.m_nNextSendSequenceNumber, (long long)seg.m_pMsg->m_nMessageNumber,
+				seg.m_nOffset, seg.m_cbSegSize, seg.m_nOffset+seg.m_cbSegSize,
 				(long long)range.m_nBegin, (long long)range.m_nEnd );
 
 			// Add to table of in-flight reliable ranges
@@ -1689,32 +1770,36 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 			inFlightPkt.m_vecReliableSegments.push_back( range );
 
 			// Less reliable data pending
-			m_senderState.m_cbPendingReliable -= seg.m_cbSize;
+			m_senderState.m_cbPendingReliable -= seg.m_cbSegSize;
 			Assert( m_senderState.m_cbPendingReliable >= 0 );
 		}
 		else
 		{
 			// We should only encode an empty segment if the message itself is empty
-			Assert( seg.m_cbSize > 0 || ( seg.m_cbSize == 0 && seg.m_pMsg->m_cbSize == 0 ) );
+			Assert( seg.m_cbSegSize > 0 || ( seg.m_cbSegSize == 0 && seg.m_pMsg->m_cbSize == 0 ) );
 
 			// Check some stuff
-			Assert( bStillInQueue == ( seg.m_nOffset + seg.m_cbSize < seg.m_pMsg->m_cbSize ) ); // If we ended the message, we should have removed it from the queue
+			Assert( bStillInQueue == ( seg.m_nOffset + seg.m_cbSegSize < seg.m_pMsg->m_cbSize ) ); // If we ended the message, we should have removed it from the queue
 			Assert( bStillInQueue == ( ( seg.m_hdr[0] & 0x20 ) == 0 ) );
-			Assert( bStillInQueue || seg.m_pMsg->m_pNext == nullptr ); // If not in the queue, we should be detached
-			Assert( seg.m_pMsg->m_pPrev == nullptr ); // We should either be at the head of the queue, or detached
+			Assert( bStillInQueue || seg.m_pMsg->m_links.m_pNext == nullptr ); // If not in the queue, we should be detached
+			Assert( seg.m_pMsg->m_links.m_pPrev == nullptr ); // We should either be at the head of the queue, or detached
+
+			// Copy the unreliable segment into the packet
+			memcpy( pPayloadPtr, (char*)seg.m_pMsg->m_pData + seg.m_nOffset, seg.m_cbSegSize );
+			pPayloadPtr += seg.m_cbSegSize;
 
 			// Spew
 			SpewType( nLogLevelPacketDecode+1, "[%s]   encode pkt %lld unreliable msg %lld offset %d+%d=%d\n",
-				GetDescription(), (long long)m_statsEndToEnd.m_nNextSendSequenceNumber, (long long)seg.m_pMsg->m_nMsgNum,
-				seg.m_nOffset, seg.m_cbSize, seg.m_nOffset+seg.m_cbSize );
+				GetDescription(), (long long)m_statsEndToEnd.m_nNextSendSequenceNumber, (long long)seg.m_pMsg->m_nMessageNumber,
+				seg.m_nOffset, seg.m_cbSegSize, seg.m_nOffset+seg.m_cbSegSize );
 
 			// Less unreliable data pending
-			m_senderState.m_cbPendingUnreliable -= seg.m_cbSize;
+			m_senderState.m_cbPendingUnreliable -= seg.m_cbSegSize;
 			Assert( m_senderState.m_cbPendingUnreliable >= 0 );
 
 			// Done with this message?  Clean up
 			if ( !bStillInQueue )
-				delete seg.m_pMsg;
+				seg.m_pMsg->Release();
 		}
 	}
 
@@ -1727,35 +1812,59 @@ bool CSteamNetworkConnectionBase::SNP_SendPacket( SendPacketContext_t &ctx )
 		return 0;
 	}
 
-	//
-	// Encrypt it
-	//
+	// OK, we have a plaintext payload.  Encrypt and send it.
+	// What cipher are we using?
+	int nBytesSent = 0;
+	switch ( m_eNegotiatedCipher )
+	{
+		default:
+			AssertMsg1( false, "Bogus cipher %d", m_eNegotiatedCipher );
+			break;
 
-	Assert( m_bCryptKeysValid );
+		case k_ESteamNetworkingSocketsCipher_NULL:
+		{
 
-	// Adjust the IV by the packet number
-	*(uint64 *)&m_cryptIVSend.m_buf += LittleQWord( m_statsEndToEnd.m_nNextSendSequenceNumber );
+			// No encryption!
+			// Ask current transport to deliver it
+			nBytesSent = m_pTransport->SendEncryptedDataChunk( payload, cbPlainText, ctx );
+		}
+		break;
 
-	// Encrypt the chunk
-	uint8 arEncryptedChunk[ k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend + 64 ]; // Should not need pad
-	uint32 cbEncrypted = sizeof(arEncryptedChunk);
-	DbgVerify( m_cryptContextSend.Encrypt(
-		payload, cbPlainText, // plaintext
-		m_cryptIVSend.m_buf, // IV
-		arEncryptedChunk, &cbEncrypted, // output
-		nullptr, 0 // no AAD
-	) );
+		case k_ESteamNetworkingSocketsCipher_AES_256_GCM:
+		{
 
-	// Restore the IV to the base value
-	*(uint64 *)&m_cryptIVSend.m_buf -= LittleQWord( m_statsEndToEnd.m_nNextSendSequenceNumber );
+			Assert( m_bCryptKeysValid );
 
-	Assert( (int)cbEncrypted >= cbPlainText );
-	Assert( (int)cbEncrypted <= k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend ); // confirm that pad above was not necessary and we never exceed k_nMaxSteamDatagramTransportPayload, even after encrypting
+			// Adjust the IV by the packet number
+			*(uint64 *)&m_cryptIVSend.m_buf += LittleQWord( m_statsEndToEnd.m_nNextSendSequenceNumber );
 
-	//SpewMsg( "Send encrypt IV %llu + %02x%02x%02x%02x, key %02x%02x%02x%02x\n", *(uint64 *)&m_cryptIVSend.m_buf, m_cryptIVSend.m_buf[8], m_cryptIVSend.m_buf[9], m_cryptIVSend.m_buf[10], m_cryptIVSend.m_buf[11], m_cryptKeySend.m_buf[0], m_cryptKeySend.m_buf[1], m_cryptKeySend.m_buf[2], m_cryptKeySend.m_buf[3] );
+			// Encrypt the chunk
+			uint8 arEncryptedChunk[ k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend + 64 ]; // Should not need pad
+			uint32 cbEncrypted = sizeof(arEncryptedChunk);
+			DbgVerify( m_cryptContextSend.Encrypt(
+				payload, cbPlainText, // plaintext
+				m_cryptIVSend.m_buf, // IV
+				arEncryptedChunk, &cbEncrypted, // output
+				nullptr, 0 // no AAD
+			) );
 
-	// Connection-specific method to send it
-	int nBytesSent = SendEncryptedDataChunk( arEncryptedChunk, cbEncrypted, ctx );
+			//SpewMsg( "Send encrypt IV %llu + %02x%02x%02x%02x  encrypted %d %02x%02x%02x%02x\n",
+			//	*(uint64 *)&m_cryptIVSend.m_buf,
+			//	m_cryptIVSend.m_buf[8], m_cryptIVSend.m_buf[9], m_cryptIVSend.m_buf[10], m_cryptIVSend.m_buf[11],
+			//	cbEncrypted,
+			//	arEncryptedChunk[0], arEncryptedChunk[1], arEncryptedChunk[2],arEncryptedChunk[3]
+			//);
+
+			// Restore the IV to the base value
+			*(uint64 *)&m_cryptIVSend.m_buf -= LittleQWord( m_statsEndToEnd.m_nNextSendSequenceNumber );
+
+			Assert( (int)cbEncrypted >= cbPlainText );
+			Assert( (int)cbEncrypted <= k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend ); // confirm that pad above was not necessary and we never exceed k_nMaxSteamDatagramTransportPayload, even after encrypting
+
+			// Ask current transport to deliver it
+			nBytesSent = m_pTransport->SendEncryptedDataChunk( arEncryptedChunk, cbEncrypted, ctx );
+		}
+	}
 	if ( nBytesSent <= 0 )
 		return false;
 
@@ -1794,7 +1903,7 @@ void CSteamNetworkConnectionBase::SNP_GatherAckBlocks( SNPAckSerializerHelper &h
 	// that will be due any time before we have the bandwidth to send the next packet.
 	// (Assuming that we send the max packet size here.)
 	SteamNetworkingMicroseconds usecSendAcksDueBefore = usecNow;
-	SteamNetworkingMicroseconds usecTimeUntilNextPacket = SteamNetworkingMicroseconds( ( m_senderState.m_flTokenBucket - (float)k_cbSteamNetworkingSocketsMaxUDPMsgLen ) / (float)m_senderState.m_n_x * -1e6 );
+	SteamNetworkingMicroseconds usecTimeUntilNextPacket = SteamNetworkingMicroseconds( ( m_senderState.m_flTokenBucket - (float)m_cbMTUPacketSize ) / (float)m_senderState.m_n_x * -1e6 );
 	if ( usecTimeUntilNextPacket > 0 )
 		usecSendAcksDueBefore += usecTimeUntilNextPacket;
 
@@ -2189,7 +2298,7 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 
 		// Deliver it immediately, don't go through the fragmentation assembly process below.
 		// (Although that would work.)
-		ReceivedMessage( pSegmentData, cbSegmentSize, nMsgNum, usecNow );
+		ReceivedMessage( pSegmentData, cbSegmentSize, nMsgNum, k_nSteamNetworkingSend_Unreliable, usecNow );
 		return;
 	}
 
@@ -2224,16 +2333,16 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 	key.m_nMsgNum = nMsgNum;
 	key.m_nOffset = nOffset;
 	SSNPRecvUnreliableSegmentData &data = m_receiverState.m_mapUnreliableSegments[ key ];
-	if ( data.m_cbSize >= 0 )
+	if ( data.m_cbSegSize >= 0 )
 	{
 
 		// We got the same segment twice (weird, since they shouldn't be doing
 		// retry -- but remember that we're working on top of UDP, which could deliver packets
 		// multiple times).  Duplicate packet delivery is actually really rare, let's spew about it.
-		SpewMsg( "Received unreliable msg %lld offset %d twice.  Sizes %d,%d\n", nMsgNum, nOffset, data.m_cbSize, cbSegmentSize );
+		SpewMsg( "Received unreliable msg %lld offset %d twice.  Sizes %d,%d\n", nMsgNum, nOffset, data.m_cbSegSize, cbSegmentSize );
 	}
 
-	if ( data.m_cbSize >= cbSegmentSize )
+	if ( data.m_cbSegSize >= cbSegmentSize )
 	{
 
 		// The data we already have is either a duplicate, or a superset.
@@ -2243,7 +2352,7 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 
 	// Segment in the map either just got inserted, or is a subset of the segment
 	// we just received.  Replace it.
-	data.m_cbSize = cbSegmentSize;
+	data.m_cbSegSize = cbSegmentSize;
 	Assert( !data.m_bLast ); // sender is doing weird stuff or we have a bug
 	data.m_bLast = bLastSegmentInMessage;
 	memcpy( data.m_buf, pSegmentData, cbSegmentSize );
@@ -2263,7 +2372,7 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 
 		// Update.  This code looks more complicated than strictly necessary, but it works
 		// if we have overlapping segments.
-		cbMessageSize = Max( cbMessageSize, itMsgLast->first.m_nOffset + itMsgLast->second.m_cbSize );
+		cbMessageSize = std::max( cbMessageSize, itMsgLast->first.m_nOffset + itMsgLast->second.m_cbSegSize );
 
 		// Is that the end?
 		if ( itMsgLast->second.m_bLast )
@@ -2275,13 +2384,16 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 			return;
 	}
 
+	CSteamNetworkingMessage *pMsg = CSteamNetworkingMessage::New( this, cbMessageSize, nMsgNum, k_nSteamNetworkingSend_Unreliable, usecNow );
+	if ( !pMsg )
+		return;
+
 	// OK, we have the complete message!  Gather the
 	// segments into a contiguous buffer
-	uint8 *pMessage = new uint8[ cbMessageSize ];
 	for (;;)
 	{
 		Assert( itMsgStart->first.m_nMsgNum == nMsgNum );
-		memcpy( pMessage + itMsgStart->first.m_nOffset, itMsgStart->second.m_buf, itMsgStart->second.m_cbSize );
+		memcpy( (char *)pMsg->m_pData + itMsgStart->first.m_nOffset, itMsgStart->second.m_buf, itMsgStart->second.m_cbSegSize );
 
 		// Done?
 		if ( itMsgStart->second.m_bLast )
@@ -2298,12 +2410,7 @@ void CSteamNetworkConnectionBase::SNP_ReceiveUnreliableSegment( int64 nMsgNum, i
 	} while ( itMsgStart != end && itMsgStart->first.m_nMsgNum == nMsgNum );
 
 	// Deliver the message.
-	ReceivedMessage( pMessage, cbMessageSize, nMsgNum, usecNow );
-
-	// Clean up
-	// !SPEED! It would be best if we could hand ownership of this buffer to
-	// ReceivedMessage, instead of having that function copy it.
-	delete[] pMessage;
+	ReceivedMessage( pMsg );
 }
 
 bool CSteamNetworkConnectionBase::SNP_ReceiveReliableSegment( int64 nPktNum, int64 nSegBegin, const uint8 *pSegmentData, int cbSegmentSize, SteamNetworkingMicroseconds usecNow )
@@ -2642,7 +2749,8 @@ bool CSteamNetworkConnectionBase::SNP_ReceiveReliableSegment( int64 nPktNum, int
 		}
 
 		// We have a full message!  Queue it
-		ReceivedMessage( pReliableDecode, cbMsgSize, nMsgNum, usecNow );
+		if ( !ReceivedMessage( pReliableDecode, cbMsgSize, nMsgNum, k_nSteamNetworkingSend_Reliable, usecNow ) )
+			return false;
 		pReliableDecode += cbMsgSize;
 		int cbStreamConsumed = pReliableDecode-pReliableStart;
 
@@ -2932,7 +3040,7 @@ SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_ThinkSendState( Ste
 
 	// Keep sending packets until we run out of tokens
 	int nPacketsSent = 0;
-	for (;;)
+	while ( m_pTransport )
 	{
 
 		if ( nPacketsSent > k_nMaxPacketsPerThink )
@@ -2957,7 +3065,7 @@ SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_ThinkSendState( Ste
 		}
 
 		// Send the next data packet.
-		if ( !SendDataPacket( usecNow ) )
+		if ( !m_pTransport->SendDataPacket( usecNow ) )
 		{
 			// Problem sending packet.  Nuke token bucket, but request
 			// a wakeup relatively quick to check on our state again
@@ -2982,6 +3090,14 @@ SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_ThinkSendState( Ste
 
 void CSteamNetworkConnectionBase::SNP_TokenBucket_Accumulate( SteamNetworkingMicroseconds usecNow )
 {
+	// If we're not connected, just keep our bucket full
+	if ( !BStateIsConnectedForWirePurposes() )
+	{
+		m_senderState.m_flTokenBucket = k_flSendRateBurstOverageAllowance;
+		m_senderState.m_usecTokenBucketTime = usecNow;
+		return;
+	}
+
 	float flElapsed = ( usecNow - m_senderState.m_usecTokenBucketTime ) * 1e-6;
 	m_senderState.m_flTokenBucket += (float)m_senderState.m_n_x * flElapsed;
 	m_senderState.m_usecTokenBucketTime = usecNow;
@@ -3070,8 +3186,40 @@ void SSNPReceiverState::DebugCheckPackGapMap() const
 
 SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_TimeWhenWantToSendNextPacket() const
 {
-	// When does the sender want to send data?
-	SteamNetworkingMicroseconds usecNextSend = m_senderState.TimeWhenWantToSendNextPacket();
+	// We really shouldn't be trying to do this when not connected
+	if ( !BStateIsConnectedForWirePurposes() )
+	{
+		AssertMsg( false, "We shouldn't be asking about sending packets when not fully connected" );
+		return k_nThinkTime_Never;
+	}
+
+	// Reliable triggered?  Then send it right now
+	if ( !m_senderState.m_listReadyRetryReliableRange.empty() )
+		return 0;
+
+	// Anything queued?
+	SteamNetworkingMicroseconds usecNextSend;
+	if ( m_senderState.m_messagesQueued.empty() )
+	{
+
+		// Queue is empty, nothing to send except perhaps nacks (below)
+		Assert( m_senderState.PendingBytesTotal() == 0 );
+		usecNextSend = INT64_MAX;
+	}
+	else
+	{
+
+		// FIXME acks, stop_waiting?
+
+		// Have we got at least a full packet ready to go?
+		if ( m_senderState.PendingBytesTotal() >= m_cbMaxPlaintextPayloadSend )
+			// Send it ASAP
+			return 0;
+
+		// We have less than a full packet's worth of data.  Wait until
+		// the Nagle time, if we have one
+		usecNextSend = m_senderState.m_messagesQueued.m_pFirst->SNPSend_UsecNagle();
+	}
 
 	// Check if the receiver wants to send a NACK.
 	usecNextSend = std::min( usecNextSend, m_receiverState.m_itPendingNack->second.m_usecWhenOKToNack );
@@ -3083,11 +3231,15 @@ SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_TimeWhenWantToSendN
 SteamNetworkingMicroseconds CSteamNetworkConnectionBase::SNP_GetNextThinkTime( SteamNetworkingMicroseconds usecNow )
 {
 	// We really shouldn't be trying to do this when not connected
-	if ( GetState() != k_ESteamNetworkingConnectionState_Connected )
+	if ( !BStateIsConnectedForWirePurposes() )
 	{
 		AssertMsg( false, "We shouldn't be trying to think SNP when not fully connected" );
 		return k_nThinkTime_Never;
 	}
+
+	// We cannot send any packets if we don't have transport
+	if ( !m_pTransport )
+		return k_nThinkTime_Never;
 
 	// Start with the time when the receiver needs to flush out ack.
 	SteamNetworkingMicroseconds usecNextThink = m_receiverState.TimeWhenFlushAcks();
@@ -3145,33 +3297,41 @@ void CSteamNetworkConnectionBase::SNP_PopulateQuickStats( SteamNetworkingQuickCo
 	info.m_cbPendingUnreliable = m_senderState.m_cbPendingUnreliable;
 	info.m_cbPendingReliable = m_senderState.m_cbPendingReliable;
 	info.m_cbSentUnackedReliable = m_senderState.m_cbSentUnackedReliable;
-
-	// Accumulate tokens so that we can properly predict when the next time we'll be able to send something is
-	SNP_TokenBucket_Accumulate( usecNow );
-
-	//
-	// Time until we can send the next packet
-	// If anything is already queued, then that will have to go out first.  Round it down
-	// to the nearest packet.
-	//
-	// NOTE: This ignores the precise details of SNP framing.  If there are tons of
-	// small packets, it'll actually be worse.  We might be able to approximate that
-	// the framing overhead better by also counting up the number of *messages* pending.
-	// Probably not worth it here, but if we had that number available, we'd use it.
-	int cbPendingTotal = m_senderState.PendingBytesTotal() / k_cbSteamNetworkingSocketsMaxMessageNoFragment * k_cbSteamNetworkingSocketsMaxMessageNoFragment;
-
-	// Adjust based on how many tokens we have to spend now (or if we are already
-	// over-budget and have to wait until we could spend another)
-	cbPendingTotal -= (int)m_senderState.m_flTokenBucket;
-	if ( cbPendingTotal <= 0 )
+	if ( GetState() == k_ESteamNetworkingConnectionState_Connected )
 	{
-		// We could send it right now.
-		info.m_usecQueueTime = 0;
+
+		// Accumulate tokens so that we can properly predict when the next time we'll be able to send something is
+		SNP_TokenBucket_Accumulate( usecNow );
+
+		//
+		// Time until we can send the next packet
+		// If anything is already queued, then that will have to go out first.  Round it down
+		// to the nearest packet.
+		//
+		// NOTE: This ignores the precise details of SNP framing.  If there are tons of
+		// small packets, it'll actually be worse.  We might be able to approximate that
+		// the framing overhead better by also counting up the number of *messages* pending.
+		// Probably not worth it here, but if we had that number available, we'd use it.
+		int cbPendingTotal = m_senderState.PendingBytesTotal() / m_cbMaxMessageNoFragment * m_cbMaxMessageNoFragment;
+
+		// Adjust based on how many tokens we have to spend now (or if we are already
+		// over-budget and have to wait until we could spend another)
+		cbPendingTotal -= (int)m_senderState.m_flTokenBucket;
+		if ( cbPendingTotal <= 0 )
+		{
+			// We could send it right now.
+			info.m_usecQueueTime = 0;
+		}
+		else
+		{
+
+			info.m_usecQueueTime = (int64)cbPendingTotal * k_nMillion / SNP_ClampSendRate();
+		}
 	}
 	else
 	{
-
-		info.m_usecQueueTime = (int64)cbPendingTotal * k_nMillion / SNP_ClampSendRate();
+		// We'll never be able to send it.  (Or, we don't know when that will be.)
+		info.m_usecQueueTime = INT64_MAX;
 	}
 }
 
@@ -3180,7 +3340,7 @@ void CSteamNetworkConnectionBase::SNP_PopulateP2PSessionStateStats( P2PSessionSt
 {
 	info.m_nBytesQueuedForSend = 0;
 	info.m_nPacketsQueuedForSend = 0;
-	for ( SNPSendMessage_t *pMsg = m_senderState.m_messagesQueued.m_pFirst ; pMsg ; pMsg = pMsg->m_pNext )
+	for ( CSteamNetworkingMessage *pMsg = m_senderState.m_messagesQueued.m_pFirst ; pMsg ; pMsg = pMsg->m_links.m_pNext )
 	{
 		info.m_nBytesQueuedForSend += pMsg->m_cbSize;
 		info.m_nPacketsQueuedForSend += 1;

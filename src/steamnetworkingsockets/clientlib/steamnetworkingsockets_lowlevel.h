@@ -302,11 +302,6 @@ private:
 //
 /////////////////////////////////////////////////////////////////////////////
 
-/// Flag to signal that we want to be active.  If this is false, either
-/// we haven't activated a service that needs the service thread, or
-/// we've failed to initialize, or we're shutting down.
-extern std::atomic<bool> g_bWantThreadRunning;
-
 /// Called when we know it's safe to actually destroy sockets pending deletion.
 /// This is when: 1.) We own the lock and 2.) we aren't polling in the service thread.
 extern void ProcessPendingDestroyClosedRawUDPSockets();
@@ -351,14 +346,16 @@ extern void SteamNetworkingSocketsLowLevelDecRef();
 /// there will be very little contention and the should be held only for a short amount of time.
 struct SteamDatagramTransportLock
 {
-	inline SteamDatagramTransportLock() { Lock(); }
+	inline SteamDatagramTransportLock( const char *pszTag = nullptr ) { Lock( pszTag ); }
 	inline ~SteamDatagramTransportLock() { Unlock(); }
-	static void Lock();
-	static bool TryLock( int msTimeout );
+	static void Lock( const char *pszTag );
+	static bool TryLock( const char *pszTag, int msTimeout );
 	static void Unlock();
-	static void OnLocked();
+	static void OnLocked( const char *pszTag );
 	static void AssertHeldByCurrentThread();
-	static void SetLongLockWarningThresholdMS( int msWarningThreshold );
+	static void AssertHeldByCurrentThread( const char *pszTag );
+	static void SetLongLockWarningThresholdMS( const char *pszTag, int msWarningThreshold );
+	static void AddTag( const char *pszTag );
 	static int s_nLocked;
 };
 
